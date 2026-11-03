@@ -63,6 +63,7 @@ function PromoteDialog({ onClose }: { readonly onClose: () => void }) {
   const client = useQueryClient();
   const sources = useQuery({ queryKey: ['admin', 'enterprise-mcp-promotable'], queryFn: listPromotableMcp });
   const [source, setSource] = useState<McpPromotable | null>(null);
+  const [oauthSource, setOauthSource] = useState(false);
   const [form, setForm] = useState<ServerInput>(() => ({
     name: '',
     title: '',
@@ -98,13 +99,16 @@ function PromoteDialog({ onClose }: { readonly onClose: () => void }) {
   });
   const pick = (item: McpPromotable) => {
     setSource(item);
+    // OAuth 收编没有凭据重填入口（OAuthInput 要去对方后台建应用），先落成共享凭据让系统管理员重填请求头
+    const isOAuth = item.server.auth === 'oauth';
+    setOauthSource(isOAuth);
     const suggested = `ent-${item.server.name}`.replace(/[^a-z0-9-]/g, '').slice(0, 24);
     setForm({
       name: SERVER_NAME.test(suggested) ? suggested : '',
       title: item.server.title,
       url: item.server.url,
       timeoutSeconds: item.server.timeoutSeconds,
-      auth: item.server.auth,
+      auth: isOAuth ? 'shared' : item.server.auth,
       headers: [],
     });
   };
@@ -149,6 +153,12 @@ function PromoteDialog({ onClose }: { readonly onClose: () => void }) {
             来源：{source.workspaceName} 的「{source.server.title}」。工具的允许/需确认/禁用会按原名带过来；
             共享凭据、OAuth 应用密钥要重填（那是那个部门的账号，不随收编走）。标识要用新的名字。
           </p>
+          {oauthSource ? (
+            <p className="kw-detail-note">
+              来源服务是 OAuth 接入：收编时已改为共享凭据，请在下方填请求头；要走 OAuth 就先「接入」登记，
+              再在对方应用里为本空间重配回调地址。
+            </p>
+          ) : null}
           <Field label="标识" help="小写字母开头，小写字母、数字、连字符，最多 24 个字符" required>
             {(id) => (
               <Input id={id} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
