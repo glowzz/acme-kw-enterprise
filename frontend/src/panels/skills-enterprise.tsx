@@ -291,8 +291,8 @@ export function SkillsEnterprisePanel() {
           pending={saveEnv.isPending}
           onSave={async (values) => {
             try {
+              // 失效查询在 saveEnv 的 onSuccess 里做一次，这里不再重复
               await saveEnv.mutateAsync({ skill: envEditing, values });
-              await client.invalidateQueries({ queryKey: [...SKILL_KEYS.list] });
               setEnvEditing(null);
               return true;
             } catch (error) {

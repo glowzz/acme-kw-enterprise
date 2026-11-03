@@ -37,8 +37,11 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
   const all = audience.includes('*');
   const [picked, setPicked] = useState<ReadonlySet<string>>(() => new Set(all ? [] : audience));
   const [allOn, setAllOn] = useState(all);
+  // 发放记录里可能残留已关闭空间的 id：列表里没有对应的行，勾不掉；保存时把它们移除（服务层本来也不收）
+  const known = new Set((workspaces.data ?? []).map((workspace) => workspace.id));
+  const staleCount = all ? 0 : [...audience].filter((id) => !known.has(id)).length;
   const submit = async () => {
-    if (await onSave(allOn ? ['*'] : [...picked])) onClose();
+    if (await onSave(allOn ? ['*'] : [...picked].filter((id) => known.has(id)))) onClose();
   };
   return (
     <Dialog
@@ -48,6 +51,9 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
       footer={<DialogActions okText="保存" onOk={() => void submit()} loading={pending} onCancel={onClose} />}
     >
       <p className="kw-secondary-text">发到空间后默认全体成员可用；空间管理员可以在本空间停用或收窄给谁用。</p>
+      {staleCount > 0 ? (
+        <p className="kw-detail-note">{`发放记录里有 ${staleCount} 个指向已关闭的空间，保存时会移除。`}</p>
+      ) : null}
       <div className="kw-check-list">
         <Checkbox
           label="全部空间（以后新建的也发放）"
