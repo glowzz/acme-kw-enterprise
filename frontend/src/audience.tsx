@@ -41,9 +41,11 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
   // 「还没加载出来」不等于「已关闭」：列表没就绪时不算残留、也不允许保存（非全部模式下会把发放清空）。
   const listReady = workspaces.isSuccess;
   const known = new Set((workspaces.data ?? []).map((workspace) => workspace.id));
-  const staleCount = listReady && !all ? [...audience].filter((id) => !known.has(id)).length : 0;
+  const staleCount = listReady && !allOn ? [...audience].filter((id) => !known.has(id)).length : 0;
+  // 清空发放（[]）是合法状态但基本是误操作：非全部模式下一个都没勾就不允许保存
+  const canSave = allOn ? true : listReady && picked.size > 0;
   const submit = async () => {
-    if (!allOn && !listReady) return;
+    if (!allOn && (!listReady || picked.size === 0)) return;
     if (await onSave(allOn ? ['*'] : [...picked].filter((id) => known.has(id)))) onClose();
   };
   return (
@@ -56,7 +58,7 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
           okText="保存"
           onOk={() => void submit()}
           loading={pending}
-          disabled={!allOn && !listReady}
+          disabled={!canSave}
           onCancel={onClose}
         />
       }
