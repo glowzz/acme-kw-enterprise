@@ -230,7 +230,7 @@ export function SkillsEnterprisePanel() {
               { key: 'audience', label: '发放', onClick: () => setAudienceEditing(skill) },
               { key: 'detail', label: '详情', onClick: () => setDetailId(skill.id) },
               ...(skill.status === 'draft' || skill.hasUnpublishedChanges
-                ? [{ key: 'publish', label: '发布', onClick: () => void publish.mutateAsync(skill) }]
+                ? [{ key: 'publish', label: '发布', onClick: () => publish.mutate(skill) }]
                 : []),
               ...(manifestEnv(skill).length > 0
                 ? [{ key: 'env', label: '环境变量', onClick: () => setEnvEditing(skill) }]
