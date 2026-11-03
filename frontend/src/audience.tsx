@@ -1,0 +1,108 @@
+/**
+ * 「发给哪些空间」的展示与编辑：企业技能、企业 MCP 共用（audience 存法一样：["*"] 或空间 id 列表）。
+ * 编辑框要的空间清单来自空间管理接口（只有系统管理员能调，面板本来就只给系统管理员）。
+ */
+import { useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Checkbox } from '@openai/apps-sdk-ui/components/Checkbox';
+import { Dialog, DialogActions } from '@knowwork/web/ui/Dialog';
+import { Skeleton } from '@knowwork/web/ui/Skeleton';
+import { toast } from '@knowwork/web/ui/toastStore';
+import { readableError } from '@knowwork/web/api/http';
+import { listWorkspaces, WORKSPACES_KEY, type WorkspaceSummary } from './api';
+
+/** 空间清单：发放目标与收编来源都要用。 */
+export function useWorkspaces() {
+  return useQuery({ queryKey: WORKSPACES_KEY, queryFn: listWorkspaces });
+}
+
+export function audienceText(audience: readonly string[], workspaces?: readonly WorkspaceSummary[]): string {
+  if (audience.includes('*')) return '全部空间';
+  if (audience.length === 0) return '未发放';
+  if (!workspaces) return `${audience.length} 个空间`;
+  const names = audience.map((id) => workspaces.find((workspace) => workspace.id === id)?.name ?? id);
+  return names.length <= 3 ? names.join('、') : `${names.slice(0, 3).join('、')} 等 ${names.length} 个空间`;
+}
+
+interface EditorProps {
+  readonly title: string;
+  readonly audience: readonly string[];
+  readonly pending: boolean;
+  readonly onSave: (workspaces: string[]) => Promise<boolean>;
+  readonly onClose: () => void;
+}
+
+export function AudienceEditor({ title, audience, pending, onSave, onClose }: EditorProps) {
+  const workspaces = useWorkspaces();
+  const all = audience.includes('*');
+  const [picked, setPicked] = useState<ReadonlySet<string>>(() => new Set(all ? [] : audience));
+  const [allOn, setAllOn] = useState(all);
+  const submit = async () => {
+    if (await onSave(allOn ? ['*'] : [...picked])) onClose();
+  };
+  return (
+    <Dialog
+      title={title}
+      onClose={onClose}
+      size="md"
+      footer={<DialogActions okText="保存" onOk={() => void submit()} loading={pending} onCancel={onClose} />}
+    >
+      <p className="kw-secondary-text">发到空间后默认全体成员可用；空间管理员可以在本空间停用或收窄给谁用。</p>
+      <div className="kw-check-list">
+        <Checkbox
+          label="全部空间（以后新建的也发放）"
+          checked={allOn}
+          onCheckedChange={(on) => setAllOn(on === true)}
+        />
+        {!allOn ? (
+          workspaces.isPending ? (
+            <Skeleton rows={3} />
+          ) : workspaces.isError ? (
+            <p className="kw-secondary-text">{readableError(workspaces.error, '空间列表没有加载出来')}</p>
+          ) : (
+            (workspaces.data ?? []).map((workspace) => (
+              <Checkbox
+                key={workspace.id}
+                label={workspace.name}
+                checked={picked.has(workspace.id)}
+                onCheckedChange={(on) =>
+                  setPicked((prev) => {
+                    const next = new Set(prev);
+                    if (on === true) next.add(workspace.id);
+                    else next.delete(workspace.id);
+                    return next;
+                  })
+                }
+              />
+            ))
+          )
+        ) : null}
+      </div>
+    </Dialog>
+  );
+}
+
+/** 改发放的通用动作：面板把各自的 set 函数与查询键传进来；失败给 toast，成功返回 true（供对话框收尾）。 */
+export function useSetAudience(
+  set: (id: string, workspaces: string[]) => Promise<unknown>,
+  invalidate: readonly (readonly unknown[])[],
+) {
+  const client = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: ({ id, workspaces }: { id: string; workspaces: string[] }) => set(id, workspaces),
+    onSuccess: async (_data, variables) => {
+      await Promise.all(invalidate.map((queryKey) => client.invalidateQueries({ queryKey })));
+      toast.success(variables.workspaces.includes('*') ? '已发给全部空间' : '已保存发给哪些空间');
+    },
+  });
+  const run = async (input: { id: string; workspaces: string[] }): Promise<boolean> => {
+    try {
+      await mutation.mutateAsync(input);
+      return true;
+    } catch (error) {
+      toast.error(readableError(error, '没有保存成功'));
+      return false;
+    }
+  };
+  return { run, pending: mutation.isPending };
+}

@@ -1,0 +1,22 @@
+/**
+ * 扩展前端入口：web 构建时经 KNOWWORK_WEB_EXTENSIONS 指到这里（vite.config.ts 的别名
+ * @knowwork/extensions），install(register) 把菜单、页面与面板注册进命名插槽。
+ * 插槽类型来自开源的 slots/registry.ts；只 import 类型，运行时不反向依赖注册方。
+ */
+import type { RouteObject } from 'react-router';
+import { BookOpen } from '@openai/apps-sdk-ui/components/Icon';
+import type { Register } from '@knowwork/web/slots/registry';
+import { WorkspacesPage } from './pages/workspaces';
+import { SkillsEnterprisePanel } from './panels/skills-enterprise';
+import { ToolsEnterprisePanel } from './panels/tools-enterprise';
+
+export function install(register: Register): void {
+  // 管理后台「系统」分组的菜单项（只有系统管理员可见，排在「模型」后面）
+  register('system.nav', { to: '/admin/workspaces', label: '空间管理', icon: <BookOpen /> });
+  // 管理后台页面，path 相对 /admin
+  register('admin.routes', { path: 'workspaces', element: <WorkspacesPage /> } satisfies RouteObject);
+  // 「技能 → 企业」页签：系统管理员的管理面板（非系统管理员仍看本空间的设置，开源已分支）
+  register('admin.skills.enterprise', { children: <SkillsEnterprisePanel /> });
+  // 「工具与 MCP → 企业」页签：同上
+  register('admin.tools.enterprise', { children: <ToolsEnterprisePanel /> });
+}

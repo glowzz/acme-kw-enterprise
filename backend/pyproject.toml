@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "acme-knowwork-enterprise"
+version = "0.1.0"
+description = "KnowWork 企业扩展包（自研）：空间管理、企业技能管理、企业 MCP 管理"
+requires-python = ">=3.12"
+# knowwork_server 由宿主环境（KnowWork 的 server venv）提供，不在这里声明依赖、不锁版本：
+# 装进哪套环境就按哪套的版本跑，升级兼容性由扩展自己的测试兜底（设计文档 9.4）。
+dependencies = []
+
+[project.entry-points."knowwork.license"]
+acme-license = "acme.kw_enterprise.license:Verifier"
+
+[project.entry-points."knowwork.extensions"]
+# 指向模块级实例（上游 loader 对扩展不做实例化，合同就是对象本身，同 tests/extensions/demo.py 的 EXTENSION）
+enterprise = "acme.kw_enterprise.extension:EXTENSION"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/acme"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
