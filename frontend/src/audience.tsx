@@ -52,6 +52,24 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
     if (!allOn && (!listReady || validPicked.length === 0)) return;
     if (await onSave(allOn ? ['*'] : validPicked)) onClose();
   };
+  // 保存被禁或记录有残留时的解释文案，按成因区分：
+  // - 「全部残留」只在本就没勾任何在线空间且原始记录不含 '*' 时成立（刚从「全部」切回、列表为空都给中性提示）；
+  // - 用户自己取消勾选导致的 validPicked=0 也是中性提示，不误归因到已关闭空间。
+  const note = (() => {
+    if (!listReady || allOn) return null;
+    const nonStarIds = [...audience].filter((id) => id !== '*');
+    const allStale = !all && nonStarIds.length > 0 && staleCount === nonStarIds.length;
+    if ((workspaces.data ?? []).length === 0) return '当前没有可发放的空间。';
+    if (validPicked.length === 0) {
+      return allStale
+        ? '发放记录全部指向已关闭的空间：请先重新勾选要发放的空间。'
+        : '请至少勾选一个要发放的空间。';
+    }
+    if (staleCount > 0) {
+      return `发放记录里有 ${staleCount} 个指向已关闭的空间，保存时会移除。`;
+    }
+    return null;
+  })();
   return (
     <Dialog
       title={title}
@@ -68,20 +86,7 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
       }
     >
       <p className="kw-secondary-text">发到空间后默认全体成员可用；空间管理员可以在本空间停用或收窄给谁用。</p>
-      {(() => {
-        if (!listReady || allOn) return null;
-        // 「全部残留」只在本就没勾任何在线空间时成立；用户自己取消勾选的场合给中性提示
-        const nonStarIds = [...audience].filter((id) => id !== '*');
-        if (validPicked.length === 0) {
-          return staleCount > 0 && staleCount === nonStarIds.length
-            ? '发放记录全部指向已关闭的空间：请先重新勾选要发放的空间。'
-            : '请至少勾选一个要发放的空间。';
-        }
-        if (staleCount > 0) {
-          return `发放记录里有 ${staleCount} 个指向已关闭的空间，保存时会移除。`;
-        }
-        return null;
-      })()}
+      {note ? <p className="kw-secondary-text">{note}</p> : null}
       <div className="kw-check-list">
         <Checkbox
           label="全部空间（以后新建的也发放）"
