@@ -68,13 +68,20 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
       }
     >
       <p className="kw-secondary-text">发到空间后默认全体成员可用；空间管理员可以在本空间停用或收窄给谁用。</p>
-      {staleCount > 0 ? (
-        <p className="kw-detail-note">
-          {validPicked.length > 0
-            ? `发放记录里有 ${staleCount} 个指向已关闭的空间，保存时会移除。`
-            : '发放记录全部指向已关闭的空间：请先重新勾选要发放的空间。'}
-        </p>
-      ) : null}
+      {(() => {
+        if (!listReady || allOn) return null;
+        // 「全部残留」只在本就没勾任何在线空间时成立；用户自己取消勾选的场合给中性提示
+        const nonStarIds = [...audience].filter((id) => id !== '*');
+        if (validPicked.length === 0) {
+          return staleCount > 0 && staleCount === nonStarIds.length
+            ? '发放记录全部指向已关闭的空间：请先重新勾选要发放的空间。'
+            : '请至少勾选一个要发放的空间。';
+        }
+        if (staleCount > 0) {
+          return `发放记录里有 ${staleCount} 个指向已关闭的空间，保存时会移除。`;
+        }
+        return null;
+      })()}
       <div className="kw-check-list">
         <Checkbox
           label="全部空间（以后新建的也发放）"
