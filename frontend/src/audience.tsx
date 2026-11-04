@@ -39,14 +39,18 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
   const [allOn, setAllOn] = useState(all);
   // 发放记录里可能残留已关闭空间的 id：列表里没有对应的行，勾不掉；保存时把它们移除（服务层本来也不收）。
   // 「还没加载出来」不等于「已关闭」：列表没就绪时不算残留、也不允许保存（非全部模式下会把发放清空）。
+  // '*' 不是空间 id（全部模式的标记），不算残留；有效勾选数按「picked ∩ 已知空间」算，全残留时等于 0，保存被拦。
   const listReady = workspaces.isSuccess;
   const known = new Set((workspaces.data ?? []).map((workspace) => workspace.id));
-  const staleCount = listReady && !allOn ? [...audience].filter((id) => !known.has(id)).length : 0;
-  // 清空发放（[]）是合法状态但基本是误操作：非全部模式下一个都没勾就不允许保存
-  const canSave = allOn ? true : listReady && picked.size > 0;
+  const staleCount = listReady && !allOn
+    ? [...audience].filter((id) => id !== '*' && !known.has(id)).length
+    : 0;
+  const validPicked = [...picked].filter((id) => known.has(id));
+  // 清空发放（[]）是合法状态但基本是误操作：非全部模式下有效勾选为 0 就不允许保存
+  const canSave = allOn ? true : listReady && validPicked.length > 0;
   const submit = async () => {
-    if (!allOn && (!listReady || picked.size === 0)) return;
-    if (await onSave(allOn ? ['*'] : [...picked].filter((id) => known.has(id)))) onClose();
+    if (!allOn && (!listReady || validPicked.length === 0)) return;
+    if (await onSave(allOn ? ['*'] : validPicked)) onClose();
   };
   return (
     <Dialog
@@ -65,7 +69,11 @@ export function AudienceEditor({ title, audience, pending, onSave, onClose }: Ed
     >
       <p className="kw-secondary-text">发到空间后默认全体成员可用；空间管理员可以在本空间停用或收窄给谁用。</p>
       {staleCount > 0 ? (
-        <p className="kw-detail-note">{`发放记录里有 ${staleCount} 个指向已关闭的空间，保存时会移除。`}</p>
+        <p className="kw-detail-note">
+          {validPicked.length > 0
+            ? `发放记录里有 ${staleCount} 个指向已关闭的空间，保存时会移除。`
+            : '发放记录全部指向已关闭的空间：请先重新勾选要发放的空间。'}
+        </p>
       ) : null}
       <div className="kw-check-list">
         <Checkbox
