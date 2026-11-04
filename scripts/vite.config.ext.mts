@@ -14,8 +14,9 @@ import { defineConfig, mergeConfig, type UserConfig } from 'vite';
 import upstream from '../../KnowWork-stable/web/vite.config.ts';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url)); // .../acme-kw-enterprise/scripts/
-const EXT_ROOT = fileURLToPath(new URL('..', import.meta.url)); // .../acme-kw-enterprise/
-const KW_STABLE = fileURLToPath(new URL('../../KnowWork-stable', import.meta.url));
+// 注意保留结尾斜杠：fileURLToPath 不补斜杠，少了它拼路径会变成 acme-kw-enterprisefrontend
+const EXT_ROOT = fileURLToPath(new URL('../', import.meta.url)); // .../acme-kw-enterprise/
+const KW_STABLE = fileURLToPath(new URL('../../KnowWork-stable/', import.meta.url)); // .../KnowWork-stable/
 
 type ConfigFn = (env: { command: 'serve' | 'build'; mode: string }) => UserConfig | Promise<UserConfig>;
 
