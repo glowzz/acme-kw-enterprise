@@ -9,10 +9,9 @@ import { Button } from '@openai/apps-sdk-ui/components/Button';
 import { Plus } from '@openai/apps-sdk-ui/components/Icon';
 import { Input } from '@openai/apps-sdk-ui/components/Input';
 import { readableError } from '@knowwork/web/api/http';
-import { searchUsers } from '@knowwork/web/api/identity';
 import { formatDateTime } from '@knowwork/web/utils/format';
-import type { CurrentUser } from '@knowwork/web/api/auth';
 import { useIsSystemAdmin } from '@knowwork/web/features/brand/queries';
+import { UserPicker } from '@knowwork/web/features/admin/members/UserPicker';
 import { Dialog, DialogActions } from '@knowwork/web/ui/Dialog';
 import { Empty } from '@knowwork/web/ui/Empty';
 import { Field } from '@knowwork/web/ui/Field';
@@ -33,15 +32,9 @@ import {
 function CreateDialog({ onClose }: { readonly onClose: () => void }) {
   const client = useQueryClient();
   const [name, setName] = useState('');
-  const [ownerQuery, setOwnerQuery] = useState('');
-  const [owner, setOwner] = useState<CurrentUser | null>(null);
-  const candidates = useQuery({
-    queryKey: ['system', 'owner-candidates', ownerQuery],
-    queryFn: () => searchUsers(ownerQuery),
-    enabled: ownerQuery.trim().length > 0,
-  });
+  const [ownerId, setOwnerId] = useState<string | undefined>(undefined);
   const create = useMutation({
-    mutationFn: () => createWorkspace(name.trim(), owner?.id ?? ''),
+    mutationFn: () => createWorkspace(name.trim(), ownerId ?? ''),
     onSuccess: async (created) => {
       await client.invalidateQueries({ queryKey: WORKSPACES_KEY });
       toast.success(`已创建空间「${created.name}」，到该空间的成员页邀请成员`);
@@ -49,7 +42,7 @@ function CreateDialog({ onClose }: { readonly onClose: () => void }) {
     },
     onError: (error) => toast.error(readableError(error, '没有创建成功')),
   });
-  const canSubmit = name.trim().length > 0 && owner !== null;
+  const canSubmit = name.trim().length > 0 && ownerId !== undefined;
   return (
     <Dialog
       title="新建空间"
@@ -62,33 +55,14 @@ function CreateDialog({ onClose }: { readonly onClose: () => void }) {
           <Input id={id} value={name} maxLength={64} onChange={(e) => setName(e.target.value)} placeholder="例如：销售部" />
         )}
       </Field>
-      <Field label="所有者" help="空间的第一个所有者，之后他能在空间里邀请成员" required>
-        {owner ? (
-          <div className="kw-labeled">
-            <span>{owner.name}</span>
-            <span className="kw-secondary-text">{owner.email}</span>
-            <Button color="secondary" variant="ghost" onClick={() => setOwner(null)}>重选</Button>
-          </div>
-        ) : (
-          <>
-            <Input
-              value={ownerQuery}
-              onChange={(e) => setOwnerQuery(e.target.value)}
-              placeholder="从当前空间的成员里选（新建后可在它的成员页邀请更多）"
-            />
-            {ownerQuery.trim() ? (
-              candidates.isPending ? (
-                <Skeleton rows={2} />
-              ) : (
-                (candidates.data ?? []).slice(0, 8).map((user) => (
-                  <button key={user.id} type="button" className="kw-list-item" onClick={() => setOwner(user)}>
-                    <span>{user.name}</span>
-                    <span className="kw-secondary-text">{user.email}</span>
-                  </button>
-                ))
-              )
-            ) : null}
-          </>
+      <Field label="所有者" help="输入姓名或邮箱搜索账号，选中者成为空间的第一个所有者" required>
+        {(id) => (
+          <UserPicker
+            id={id}
+            onChange={setOwnerId}
+            exclude={new Set()}
+            invalid={!ownerId}
+          />
         )}
       </Field>
     </Dialog>
