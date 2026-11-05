@@ -119,19 +119,22 @@ class MemoryService:
     async def edit(self, user_id: str, memory_id: str, *, content: str | None = None,
                    type: str | None = None, expires_at: datetime | None = None,
                    clear_expires: bool = False) -> dict[str, Any]:
+        if expires_at is not None and expires_at.tzinfo is None:
+            raise Invalid("期限要带时区（例如 2026-12-01T00:00:00Z）")
         async with self._sessionmaker() as session, session.begin():
             row = await _owned(session, user_id, memory_id)
             if content is not None:
                 row.content = _content_of(content)
                 row.embedding = None      # 内容变了，旧向量不再代表它；M3 的整理任务懒重算补齐
                 row.embedding_model = None
-            if type is not None:
+            if type is not None and type != row.type:
                 row.type = type
                 if type == TASK and row.expires_at is None:
                     row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
-                if type != TASK:
-                    row.expires_at = None  # 期限只在办事项有：改走别的类型就摘掉，别让整理误归档
-            if clear_expires:
+            # 期限的归属跟着最终类型走：非在办一律摘掉（同时传 type=fact 和 expiresAt 的请求也不留期限）
+            if row.type != TASK:
+                row.expires_at = None
+            elif clear_expires:
                 row.expires_at = None
             elif expires_at is not None:
                 row.expires_at = expires_at
@@ -164,12 +167,22 @@ class MemoryService:
             await session.delete(row)
 
     async def restore(self, user_id: str, memory_id: str) -> dict[str, Any]:
-        """已归档 / 已被更新 → 生效中；满额 409（提示先删几条）。"""
+        """已归档 / 已被更新 → 生效中；满额 409（提示先删几条）。
+
+        两个连带语义（R3 审查补）：
+        - 过期归档的在办事项恢复 = 再给一个默认期限窗口，不然一恢复下一次整理又把它归档，等于白点；
+        - 恢复「已被更新」的旧版本时，把取代它的那条归档——新旧互斥，不然两条矛盾记忆同时注入。"""
         async with self._sessionmaker() as session, session.begin():
             row = await _owned(session, user_id, memory_id)
             if row.status not in (ARCHIVED, SUPERSEDED):
                 raise Conflict("只有已归档或已被更新的记忆可以恢复")
             await _require_capacity(session, user_id)
+            if row.type == TASK and row.expires_at is not None and row.expires_at <= _now():
+                row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
+            if row.status == SUPERSEDED and row.superseded_by:
+                successor = await session.get(Memory, row.superseded_by)
+                if successor is not None and successor.user_id == user_id and successor.status == ACTIVE:
+                    successor.status = ARCHIVED
             row.status = ACTIVE
             row.superseded_by = None
             view = _view(row)
@@ -208,7 +221,9 @@ class MemoryService:
         async with self._sessionmaker() as session, session.begin():
             statement = pg_insert(MemorySetting).values(user_id=user_id, enabled=enabled)
             await session.execute(statement.on_conflict_do_update(
-                index_elements=[MemorySetting.user_id], set_={"enabled": statement.excluded.enabled}))
+                index_elements=[MemorySetting.user_id],
+                # 裸 upsert 不走 ORM 的 onupdate，时间戳要显式带上
+                set_={"enabled": statement.excluded.enabled, "updated_at": func.now()}))
         return {"enabled": enabled}
 
     async def workspace_setting(self, actor_id: str, workspace_id: str) -> dict[str, Any]:
@@ -225,8 +240,9 @@ class MemoryService:
         return {"disabled": row.disabled if row is not None else False}
 
     async def set_workspace_setting(self, actor_id: str, workspace_id: str, disabled: bool) -> dict[str, Any]:
-        """空间管理员停用/启用本空间的记忆。管理员判定在服务层（workspace:edit，owner/admin 过），
-        判不了宁可 403 不放过。"""
+        """空间管理员停用/启用本空间的记忆。管理员判定在服务层（workspace:edit，owner/admin 过——
+        上游默认权限表 rules.py _DEFAULTS：ADMIN 给 workspace:edit、EDITOR 只有 workspace:use，
+        成员停不掉整个空间的记忆），判不了宁可 403 不放过。"""
         if self._access is None or not await self._access.check(actor_id, workspace_id, "workspace", "edit"):
             raise Denied("只有空间管理员可以停用本空间的记忆")
         async with self._sessionmaker() as session, session.begin():
@@ -234,7 +250,7 @@ class MemoryService:
                 workspace_id=workspace_id, disabled=disabled)
             await session.execute(statement.on_conflict_do_update(
                 index_elements=[MemoryWorkspaceSetting.workspace_id],
-                set_={"disabled": statement.excluded.disabled}))
+                set_={"disabled": statement.excluded.disabled, "updated_at": func.now()}))
         return {"disabled": disabled}
 
     # ---- 导出与清空 ----

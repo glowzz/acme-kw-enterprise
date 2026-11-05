@@ -92,18 +92,32 @@ function AddDialog({ onClose }: { readonly onClose: () => void }) {
   );
 }
 
+/** UTC 时间戳 → 本地日历日（date 输入框的口径）：期限按用户看到的那一天算，不按 UTC 切。 */
+function toLocalDate(iso: string): string {
+  const date = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function EditDialog({ item, onClose }: { readonly item: MemoryItem; readonly onClose: () => void }) {
   const client = useQueryClient();
   const [content, setContent] = useState(item.content);
-  // 在办事项可改期限：日期输入只到天，按当天 00:00 (UTC) 提交给后端
-  const [deadline, setDeadline] = useState(
-    item.type === 'task' && item.expiresAt ? item.expiresAt.slice(0, 10) : '',
-  );
+  const isTask = item.type === 'task';
+  const initialDate = isTask && item.expiresAt ? toLocalDate(item.expiresAt) : '';
+  const [deadline, setDeadline] = useState(initialDate);
+  const contentChanged = content.trim() !== item.content;
+  const dateChanged = deadline !== initialDate;
   const edit = useMutation({
+    // 只提交变了的字段：内容没改就不带 content（免得白发作废向量），期限没动就不带 expiresAt
     mutationFn: () =>
       editMemory(item.id, {
-        content: content.trim(),
-        ...(item.type === 'task' && deadline ? { expiresAt: `${deadline}T00:00:00Z` } : {}),
+        ...(contentChanged ? { content: content.trim() } : {}),
+        ...(isTask && dateChanged
+          ? deadline
+            ? // 本地当天零点（解析成本地时刻再转 UTC）：选「今天」就是今天 23:59 前都有效
+              { expiresAt: new Date(`${deadline}T00:00:00`).toISOString() }
+            : { clearExpires: true }
+          : {}),
       }),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: MEMORY_KEYS.counts });
@@ -113,20 +127,19 @@ function EditDialog({ item, onClose }: { readonly item: MemoryItem; readonly onC
     },
     onError: (error) => toast.error(readableError(error, '没有修改成功')),
   });
+  const canSave = content.trim().length > 0 && (contentChanged || (isTask && dateChanged));
   return (
     <Dialog
       title="编辑记忆"
       onClose={onClose}
       onSubmit={() => edit.mutate()}
-      footer={
-        <DialogActions okText="保存" loading={edit.isPending} disabled={content.trim().length === 0} onCancel={onClose} />
-      }
+      footer={<DialogActions okText="保存" loading={edit.isPending} disabled={!canSave} onCancel={onClose} />}
     >
       <Field label="内容" required>
         {(id) => <Input id={id} value={content} maxLength={500} onChange={(e) => setContent(e.target.value)} />}
       </Field>
-      {item.type === 'task' ? (
-        <Field label="期限" help="到这天还没办完，整理时会归档这条在办事项">
+      {isTask ? (
+        <Field label="期限" help="到这天还没办完，整理时会归档这条在办事项；清空表示不设期限">
           {(id) => (
             <Input id={id} type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)} />
           )}
@@ -306,8 +319,8 @@ export function MemoryTab() {
   });
   const organize = useMutation({
     mutationFn: () => organizeNow(workspaceId ?? ''),
-    // handler 在 M3 注册：M1 只入队，措辞照实说，不承诺立刻有结果
-    onSuccess: () => toast.success('已排入整理队列，整理完成后列表会更新'),
+    // handler 在 M3 注册：M1 只入队，页面不会有可见变化，措辞照实说
+    onSuccess: () => toast.success('已排入整理队列（任务执行后生效）'),
     onError: (error) => toast.error(readableError(error, '没有排上整理任务')),
   });
   const exportAll = async () => {

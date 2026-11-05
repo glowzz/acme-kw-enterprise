@@ -99,7 +99,7 @@ export async function addMemory(type: MemoryType, content: string): Promise<void
 
 export async function editMemory(
   id: string,
-  changes: { content?: string; type?: MemoryType; expiresAt?: string },
+  changes: { content?: string; type?: MemoryType; expiresAt?: string; clearExpires?: boolean },
 ): Promise<void> {
   await request(`/api/memory/${seg(id)}`, { method: 'PATCH', body: changes });
 }

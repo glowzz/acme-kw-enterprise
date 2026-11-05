@@ -7,6 +7,7 @@
     uv run pytest ../../acme-kw-enterprise/backend/tests
 """
 
+import asyncio
 import shutil
 import tempfile
 import uuid
@@ -155,6 +156,36 @@ async def test_edit_clears_embedding_and_sets_task_ttl(sessionmaker, service):
     assert back["expiresAt"] is None  # 改走别的类型就摘期限，别让整理误归档
 
 
+async def test_edit_keeps_expiry_invariant(sessionmaker, service):
+    """期限只在办事项有：fact + expiresAt 的组合不落期限；naive datetime 拒收（422）。"""
+    added = await service.add("u1", type=FACT, content="一条事实")
+    with pytest.raises(Invalid, match="时区"):
+        await service.edit("u1", added["id"], expires_at=datetime(2026, 12, 1))  # 无 tzinfo
+    switched = await service.edit("u1", added["id"], type=TASK)
+    assert switched["expiresAt"] is not None
+    back = await service.edit("u1", added["id"], type=FACT,
+                              expires_at=datetime(2027, 1, 1, tzinfo=UTC))
+    assert back["expiresAt"] is None  # 同时传 type=fact 和 expiresAt 也不留期限
+
+
+async def test_restore_refreshes_expired_task(sessionmaker, service):
+    """过期归档的在办事项恢复 = 再给一个默认期限窗口，不然下一次整理又立刻归档。"""
+    expired = await _insert(sessionmaker, "u1", status=ARCHIVED, type=TASK,
+                            content="过期的在办事项", expires_at=datetime(2026, 1, 1, tzinfo=UTC))
+    restored = await service.restore("u1", expired)
+    assert restored["expiresAt"] is not None and restored["expiresAt"] > datetime.now(UTC)
+
+
+async def test_restore_superseded_archives_successor(sessionmaker, service):
+    """恢复「已被更新」的旧版本时，取代它的那条归档：新旧互斥，不同时注入。"""
+    new_id = await _insert(sessionmaker, "u1", status=ACTIVE)
+    old_id = await _insert(sessionmaker, "u1", status=SUPERSEDED, superseded_by=new_id)
+    restored = await service.restore("u1", old_id)
+    assert restored["status"] == ACTIVE and restored["supersededBy"] is None
+    statuses = {item["id"]: item["status"] for item in await service.export("u1")}
+    assert statuses[new_id] == ARCHIVED and statuses[old_id] == ACTIVE
+
+
 async def test_delete_is_scoped_to_owner(sessionmaker, service):
     added = await service.add("u1", type=FACT, content="查询年平均净利润")
     with pytest.raises(NotFound):
@@ -167,10 +198,11 @@ async def test_delete_is_scoped_to_owner(sessionmaker, service):
 # ---- 状态机 ----
 
 
-async def _insert(sessionmaker, user_id: str, **kwargs) -> str:
+async def _insert(sessionmaker, user_id: str, *, type: str = FACT, content: str = "占位内容",
+                  **kwargs) -> str:
     memory_id = f"mem_{uuid.uuid4().hex}"
     async with sessionmaker() as session, session.begin():
-        session.add(Memory(id=memory_id, user_id=user_id, type=FACT, content="占位内容", **kwargs))
+        session.add(Memory(id=memory_id, user_id=user_id, type=type, content=content, **kwargs))
     return memory_id
 
 
@@ -265,6 +297,17 @@ async def test_workspace_setting_gates(sessionmaker):
     access.allowed = True
     assert await service.set_workspace_setting("u1", "ws1", True) == {"disabled": True}
     assert await service.workspace_setting("u1", "ws1") == {"disabled": True}
+
+    # 裸 upsert 不走 ORM 的 onupdate：显式 set updated_at，反复保存后时间戳要真的动过
+    async with sessionmaker() as session:
+        first_updated = (await session.execute(text(
+            "SELECT updated_at FROM memory_workspace_setting"))).scalar()
+    await asyncio.sleep(0.02)
+    await service.set_workspace_setting("u1", "ws1", False)
+    async with sessionmaker() as session:
+        second_updated = (await session.execute(text(
+            "SELECT updated_at FROM memory_workspace_setting"))).scalar()
+    assert second_updated > first_updated  # 两次独立事务，update 的时间戳严格靠后（memory_setting 同路径）
 
     bare = MemoryService(sessionmaker)  # 没给 access：判不了宁可 403 不放过
     with pytest.raises(Denied):

@@ -54,19 +54,21 @@ class Memory(Base):
     content: Mapped[str] = mapped_column(Text)
     # 提取时的用户原话逐字摘录（应用层截断到 QUOTE_MAX）；手动添加/工具写入为空。
     # 待确认页展开可见出处，判断「确认/忽略」用（借鉴 octop-memory 的证据链）
-    quote: Mapped[str] = mapped_column(Text, default="")
+    quote: Mapped[str] = mapped_column(Text, default="", server_default="")
     # 在哪个空间提取的：只做排查与重嵌向量时的模型路由参考，不判权（记忆跨空间）
     origin_workspace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    source: Mapped[str] = mapped_column(String(16), default=EXTRACTED)
-    status: Mapped[str] = mapped_column(String(16), default=PENDING)
-    score: Mapped[float] = mapped_column(Float, default=1.0)  # 提取置信度起步，整理时衰减（设计 §7）
+    # default 与 server_default 并写：ORM 插入走 default，迁移建出的表对裸 SQL 也有 DEFAULT，两条路径同构
+    source: Mapped[str] = mapped_column(String(16), default=EXTRACTED, server_default=EXTRACTED)
+    status: Mapped[str] = mapped_column(String(16), default=PENDING, server_default=PENDING)
+    # 提取置信度起步，整理时衰减（设计 §7）
+    score: Mapped[float] = mapped_column(Float, default=1.0, server_default="1.0")
     # 写入时算（best-effort），失败留空；每用户 ≤200 行，进程内算余弦，不引 pgvector。
     # 换嵌入模型后维度可能不齐：不齐的跳过相似度，整理任务懒重算补齐
     embedding: Mapped[list[float] | None] = mapped_column(JSONB, nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # 记账只记 turn 段命中（这一轮的提问真的用上了）；standing 常驻不算提及——按「在场」记账
     # 会让 last_mentioned_at 永远是今天，衰减永不触发（设计 §4）
-    mention_count: Mapped[int] = mapped_column(Integer, default=0)
+    mention_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_mentioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 在办事项到期归档；被哪条新记忆取代（不设 FK：简化恢复语义）
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
