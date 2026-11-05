@@ -251,6 +251,7 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
                 continue
             candidate["action"] = decision["action"]
             candidate["target"] = decision["target"]
+            original_content = candidate["content"]  # 撤销改写时恢复原话口径，别把翻转极性的文本落 pending
             if decision["action"] in ("update", "replace") and decision.get("content"):
                 candidate["content"] = decision["content"][:CONTENT_MAX_CHARS * 2]
             if decision["action"] in ("update", "replace") and any(
@@ -260,12 +261,15 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
                 candidate["_force_drop"] = True
                 forced_drops.append(candidate)
                 continue
+            reverted = False
             if candidate.get("_conflict_clamped") and decision["action"] == "update":
                 # 矛盾候选不许原地改写生效行（那是静默翻极性）；replace 不拦——它落 pending
                 # 并暂存对手指针，确认时人工裁决（R2 的 confirm 闭环）
                 candidate["action"], candidate["target"] = "insert", ""
+                candidate["content"] = original_content
+                reverted = True
             hit = next((h for h in candidate["similar"] if h["id"] == candidate.get("target")), None)
-            if candidate.get("action") in ("update", "replace") and hit is not None:
+            if not reverted and candidate.get("action") in ("update", "replace") and hit is not None:
                 # 改写后复核（只防稀释这一个方向）：旧句带否定、新句丢了否定（「不用表格」→「用表格」）
                 # → 撤销改写转待确认；新句**新增**否定通常是细化（「用表格」→「不要长段落」），不算
                 old_tokens, new_tokens = content_tokens(hit["content"]), content_tokens(candidate["content"])
@@ -273,6 +277,7 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
                            and len(old_tokens & new_tokens) >= OVERLAP_MIN)
                 if diluted:
                     candidate["action"], candidate["target"] = "insert", ""
+                    candidate["content"] = original_content
                     candidate["confidence"] = min(candidate["confidence"], ACTIVE_CONFIDENCE - 0.01)
                 elif signature(candidate["content"]) in signatures:  # 改写撞成同义重复 → 丢弃
                     candidate["_force_drop"] = True

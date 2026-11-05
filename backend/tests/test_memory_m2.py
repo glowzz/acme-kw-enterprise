@@ -531,6 +531,8 @@ async def test_conflict_clamped_candidate_rejects_update(sessionmaker):
     async with sessionmaker() as session:
         row = await session.get(Memory, old_id)
         assert row is not None and row.content == "回答用表格输出" and row.status == ACTIVE
+        pending = (await session.execute(select(Memory).where(Memory.status == PENDING))).scalar_one()
+        assert "不用" in pending.content  # pending 行保住候选原话的极性，不是判定给的翻转文本
 
 
 async def test_diluted_rewrite_reverts_to_pending(sessionmaker):
@@ -551,3 +553,5 @@ async def test_diluted_rewrite_reverts_to_pending(sessionmaker):
     async with sessionmaker() as session:
         row = await session.get(Memory, old_id)
         assert row is not None and row.content == "回答不用表格输出"  # 原句保留
+        pending = (await session.execute(select(Memory).where(Memory.status == PENDING))).scalar_one()
+        assert "不用" in pending.content  # 撤销改写后候选恢复原话口径，不是丢「不」的判定文本
