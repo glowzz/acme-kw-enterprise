@@ -437,7 +437,8 @@ async def test_update_target_user_source_forced_noop(sessionmaker):
                                    "content": "改写手动添加的那条"}]})])
     counts = await extract_from_turn(service, models, "u1", "ws1",
                                      "回答用表格 aaaaa" + "，保持" * 5, "好的" + "，明白" * 5)
-    assert counts == {"active": 0, "pending": 0, "updated": 0, "replaced": 0, "dropped": 0}
+    assert counts == {"active": 0, "pending": 0, "updated": 0, "replaced": 0,
+                      "dropped": 1}  # 对手动行的同义重复：候选丢弃且计数可见
     async with sessionmaker() as session:
         row = await session.get(Memory, old_id)
         assert row is not None and row.content == "回答用表格"  # 手动行原样

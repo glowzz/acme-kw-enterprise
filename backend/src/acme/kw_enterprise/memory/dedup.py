@@ -24,8 +24,8 @@ def signature(content: str) -> str:
 # 「差不多」「没关系」「特别」这类高频词全是裸单字误伤面。宁可漏（漏掉的冲突有 LLM 判定与
 # 待确认兜底），不把惯用肯定句误判成否定。
 NEGATION_PHRASES = ("不用", "不要", "不能", "不会", "不想", "不喜欢", "不希望", "不可以", "不使用",
-                    "不采用", "没有", "暂不", "避免", "别用", "别再", "别发",
-                    "don't", "won't", "isn't")
+                    "不采用", "不需要", "不再", "不必", "没有", "暂不", "避免", "别用", "别再", "别发",
+                    "don't", "won't", "isn't", "can't", "aren't", "needn't")
 
 # 停词：算「内容 token 重叠」时滤掉，不参与语义比对。注意不能把否定词放进来
 _STOP_CN = ("的 了 是 我 你 他 她 它 们 我们 你们 和 与 或 在 有 就 都 也 很 被 把 吧 呢 吗"
@@ -55,7 +55,7 @@ def has_negation(text: str) -> bool:
     return bool(set(_ASCII.findall(lowered)) & _NEG_EN)  # 英文按词级匹配（not/never/no/avoid）
 
 
-_NEG_EN = frozenset({"no", "not", "never", "avoid"})
+_NEG_EN = frozenset({"no", "not", "never", "avoid", "cannot"})
 
 
 def negation_conflict(a: str, b: str) -> bool:

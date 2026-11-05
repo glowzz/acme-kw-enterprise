@@ -14,7 +14,7 @@ from knowwork_server.jobs.kinds import JobError
 from knowwork_server.models.client import ModelCallError, ModelClient
 from knowwork_server.models.schemas import Capability
 
-from .dedup import cosine, negation_conflict, signature
+from .dedup import OVERLAP_MIN, content_tokens, cosine, has_negation, negation_conflict, signature
 from .models import ACTIVE_CONFIDENCE, CONTENT_MAX, FACT, FOCUS, PREFERENCE, QUOTE_MAX, TASK
 from .service import MemoryService
 
@@ -188,6 +188,7 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
         conflict = any(negation_conflict(candidate["content"], row["content"]) for row in pool)
         if conflict:
             candidate["confidence"] = min(candidate["confidence"], ACTIVE_CONFIDENCE - 0.01)
+            candidate["_conflict_clamped"] = True  # 矛盾候选不许走 update/replace：改写会静默翻极性
         signatures.add(signature(candidate["content"]))
         kept.append(candidate)
     if not kept:
@@ -227,6 +228,7 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
                 for hit in candidate["similar"])
             for candidate in judged)
         decisions: list[dict[str, Any]] = []
+        judge_failed = False
         try:
             raw = await models.chat(workspace_id, chat_alias,
                                     [{"role": "system", "content": _JUDGE_PROMPT},
@@ -234,28 +236,50 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
                                     response_format=JUDGE_SCHEMA, max_tokens=1024, background=True)
             decisions = _parse_decisions(raw)
         except ModelCallError as error:
-            # 判定失败降级：带相似命中的候选一律进待确认（宁待确认不静默写错，也不重付提取）
+            judge_failed = True
             log.warning("memory extract: judge failed (%s); similar candidates go to pending", error.code)
-            for candidate in judged:
+        actions = {decision["slot"]: decision for decision in decisions}
+        forced_drops: list[dict[str, Any]] = []
+        for candidate in judged:
+            decision = actions.get(candidate["_slot"])
+            if judge_failed or decision is None or decision["action"] == "noop":
+                # 判定失败/不可解析/漏答/noop：一律进待确认（noop=同义重复，直接丢弃）
                 candidate["confidence"] = min(candidate["confidence"], ACTIVE_CONFIDENCE - 0.01)
-        else:
-            actions = {decision["slot"]: decision for decision in decisions}
-            forced_drops: list[dict[str, Any]] = []
-            for candidate in judged:
-                decision = actions.get(candidate["_slot"])
-                if decision is not None:
-                    candidate["action"] = decision["action"]
-                    candidate["target"] = decision["target"]
-                    if decision["action"] in ("update", "replace") and decision.get("content"):
-                        candidate["content"] = decision["content"][:CONTENT_MAX_CHARS * 2]
-                    if decision["action"] in ("update", "replace") and any(
-                            hit["id"] == decision["target"] and hit["kind"] != "extracted"
-                            for hit in candidate["similar"]):
-                        # 手动行不可改写（§7）：对手动行的同义重复，候选直接丢弃而非重复落库
-                        candidate["_force_drop"] = True
-                        forced_drops.append(candidate)
-            for candidate in forced_drops:
-                kept.remove(candidate)
+                if decision is not None and decision["action"] == "noop":
+                    candidate["_force_drop"] = True
+                    forced_drops.append(candidate)
+                continue
+            candidate["action"] = decision["action"]
+            candidate["target"] = decision["target"]
+            if decision["action"] in ("update", "replace") and decision.get("content"):
+                candidate["content"] = decision["content"][:CONTENT_MAX_CHARS * 2]
+            if decision["action"] in ("update", "replace") and any(
+                    hit["id"] == decision["target"] and hit["kind"] != "extracted"
+                    for hit in candidate["similar"]):
+                # 手动行不可改写（§7）：对手动行的同义重复，候选直接丢弃而非重复落库
+                candidate["_force_drop"] = True
+                forced_drops.append(candidate)
+                continue
+            if candidate.get("_conflict_clamped") and decision["action"] == "update":
+                # 矛盾候选不许原地改写生效行（那是静默翻极性）；replace 不拦——它落 pending
+                # 并暂存对手指针，确认时人工裁决（R2 的 confirm 闭环）
+                candidate["action"], candidate["target"] = "insert", ""
+            hit = next((h for h in candidate["similar"] if h["id"] == candidate.get("target")), None)
+            if candidate.get("action") in ("update", "replace") and hit is not None:
+                # 改写后复核（只防稀释这一个方向）：旧句带否定、新句丢了否定（「不用表格」→「用表格」）
+                # → 撤销改写转待确认；新句**新增**否定通常是细化（「用表格」→「不要长段落」），不算
+                old_tokens, new_tokens = content_tokens(hit["content"]), content_tokens(candidate["content"])
+                diluted = (has_negation(hit["content"]) and not has_negation(candidate["content"])
+                           and len(old_tokens & new_tokens) >= OVERLAP_MIN)
+                if diluted:
+                    candidate["action"], candidate["target"] = "insert", ""
+                    candidate["confidence"] = min(candidate["confidence"], ACTIVE_CONFIDENCE - 0.01)
+                elif signature(candidate["content"]) in signatures:  # 改写撞成同义重复 → 丢弃
+                    candidate["_force_drop"] = True
+                    forced_drops.append(candidate)
+        for candidate in forced_drops:
+            kept.remove(candidate)
+        pre_dropped += len(forced_drops)  # noop 丢弃与手动行保护的丢弃都计入 dropped（可排查）
 
     counts = await service.store_extract(user_id, workspace_id, kept)
     counts["dropped"] += pre_dropped

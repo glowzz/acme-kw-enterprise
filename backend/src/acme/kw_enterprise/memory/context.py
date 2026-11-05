@@ -8,7 +8,7 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from knowwork_server.conversations.turn_context import TurnContextRequest
@@ -106,8 +106,9 @@ class MemoryContext:
         turn_text, hit_ids = await self._turn_segment(request, memories)
         if hit_ids:
             self._spawn(self._service.track_mentions(request.user_id, hit_ids))
-        if memories and datetime.now().date().isoformat() != await self._service.last_organized_on(
+        if memories and datetime.now(UTC).date().isoformat() != await self._service.last_organized_on(
                 request.user_id):
+            # 两侧都用 UTC 日历日：last_organized_at 存的是 UTC，本地日比较会在 UTC+8 凌晨连排
             self._spawn(self._organize_later(request))  # 每天第一次见这个人：顺手排一条整理
         return TurnContext(standing=standing, turn=turn_text)
 

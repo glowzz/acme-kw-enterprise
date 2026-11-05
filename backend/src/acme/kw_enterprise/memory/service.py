@@ -152,18 +152,31 @@ class MemoryService:
     # ---- 状态机（设计 §3） ----
 
     async def confirm(self, user_id: str, memory_id: str) -> dict[str, Any]:
-        """待确认 → 生效中；满额 409。带对手指针的候选（replace 但当时没生效的，R2 前的
-        H3 口径）确认时把对手降为 SUPERSEDED 指回本行——新旧互斥在这里闭环。"""
+        """待确认 → 生效中；满额 409。带对手指针的候选（replace 但当时没生效的）确认时沿链
+        把仍生效的对手降为 SUPERSEDED 指回本行——互斥在这里闭环；降一升一是容量中性的，
+        先做互斥再查容量（与 restore 同口径，满额不假报 409）。"""
         async with self._sessionmaker() as session, session.begin():
             row = await _owned(session, user_id, memory_id)
             if row.status != PENDING:
                 raise Conflict("只有待确认的记忆可以确认")
-            await _require_capacity(session, user_id)
-            if row.superseded_by:
-                rival = await session.get(Memory, row.superseded_by)
-                if rival is not None and rival.user_id == user_id and rival.status == ACTIVE:
+            await _acquire_capacity_lock(session, user_id)
+            chain = [row.superseded_by] if row.superseded_by else []
+            seen: set[str] = set()
+            while chain:
+                rival_id = chain.pop()
+                if rival_id in seen:
+                    continue
+                seen.add(rival_id)
+                rival = await session.get(Memory, rival_id)
+                if rival is None or rival.user_id != user_id:
+                    continue
+                next_pointer = rival.superseded_by
+                if rival.status == ACTIVE:
                     rival.status = SUPERSEDED
                     rival.superseded_by = row.id
+                if next_pointer and next_pointer != row.id:
+                    chain.append(next_pointer)
+            await _require_capacity(session, user_id)
             row.status = ACTIVE
             row.superseded_by = None
             view = _view(row)
