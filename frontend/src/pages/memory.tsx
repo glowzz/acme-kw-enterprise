@@ -3,7 +3,7 @@
  * 添加/编辑/删除、导出与清空。只有本人看得到自己的记忆（后端按会话身份判定）。
  * 提取链路在 M2 接上：本页先覆盖手动管理与「待确认」的人工处理入口。
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '@openai/apps-sdk-ui/components/Button';
 import { Plus } from '@openai/apps-sdk-ui/components/Icon';
 import { Select } from '@openai/apps-sdk-ui/components/Select';
@@ -187,10 +187,13 @@ const PAGE_SIZE = 50;
 function MemoryList({
   status,
   cap,
+  canEdit,
   onEdit,
 }: {
   readonly status: MemoryStatus;
   readonly cap: number;
+  /** 开关关闭（个人或本空间）时只读可删：不新增不编辑，确认/忽略/恢复/删除照常 */
+  readonly canEdit: boolean;
   readonly onEdit: (item: MemoryItem) => void;
 }) {
   const [page, setPage] = useState(0);
@@ -199,6 +202,11 @@ function MemoryList({
     queryKey: [...MEMORY_KEYS.list(status), page],
     queryFn: () => listMemories(status, PAGE_SIZE, page * PAGE_SIZE),
   });
+  // 末页把行删光后 total 变小：把 page 钳回有效范围，别停在「这一页暂无记忆」回不去
+  const maxPage = Math.max(0, Math.ceil((list.data?.total ?? 0) / PAGE_SIZE) - 1);
+  useEffect(() => {
+    if (page > maxPage) setPage(maxPage);
+  }, [page, maxPage]);
   const confirm = useMemoryAction(confirmMemory, '已生效', status);
   const dismiss = useMemoryAction(dismissMemory, '已忽略', status);
   const restore = useMemoryAction(restoreMemory, '已恢复生效', status);
@@ -227,7 +235,7 @@ function MemoryList({
                   { key: 'dismiss', label: '忽略', danger: true, onClick: () => dismiss.mutate(m.id) },
                 ]
               : []),
-            ...(status === 'active' ? [{ key: 'edit', label: '编辑', onClick: () => onEdit(m) }] : []),
+            ...(status === 'active' && canEdit ? [{ key: 'edit', label: '编辑', onClick: () => onEdit(m) }] : []),
             ...(status === 'superseded' || status === 'archived'
               ? [{ key: 'restore', label: '恢复', onClick: () => restore.mutate(m.id) }]
               : []),
@@ -240,7 +248,7 @@ function MemoryList({
 
   if (list.isPending) return <Skeleton rows={4} />;
   if (list.isError) return <Empty title={readableError(list.error, '记忆列表没有加载出来')} />;
-  if (!list.data || list.data.items.length === 0)
+  if (!list.data || (list.data.items.length === 0 && page <= maxPage))
     return (
       <Empty
         title={status === 'active' ? `还没有生效中的记忆（上限 ${cap} 条）` : '这一页暂无记忆'}
@@ -319,10 +327,13 @@ export function MemoryTab() {
 
   const cap = counts.data?.cap ?? 200;
   const active = counts.data?.active ?? 0;
+  const enabled = settings.data?.enabled ?? true;
+  const workspaceDisabled = workspaceSetting.data?.disabled ?? false;
+  const canEdit = enabled && !workspaceDisabled;
   const tabs: readonly TabItem[] = STATUSES.map(({ key, label }) => ({
     key,
     label: key === 'active' ? `${label} (${active}/${cap})` : `${label} (${counts.data?.[key] ?? 0})`,
-    children: <MemoryList status={key} cap={cap} onEdit={setEditing} />,
+    children: <MemoryList status={key} cap={cap} canEdit={canEdit} onEdit={setEditing} />,
   }));
 
   return (
@@ -332,29 +343,42 @@ export function MemoryTab() {
       </p>
       <Switch
         label="为我启用个人记忆"
-        checked={settings.data?.enabled ?? true}
-        onCheckedChange={(enabled) => toggle.mutate(enabled)}
+        checked={enabled}
+        disabled={workspaceDisabled}
+        onCheckedChange={(value) => toggle.mutate(value)}
       />
-      {workspaceSetting.data?.disabled ? (
+      {!enabled ? (
+        <p className="kw-secondary-text">助手当前不读取、不新增你的记忆；已有的记忆保留，列表可查看与删除。</p>
+      ) : null}
+      {workspaceDisabled ? (
         <p className="kw-secondary-text">本空间已停用记忆：在这个空间里助手不读取、不新增记忆；其他空间与已有数据不受影响。</p>
       ) : null}
       <Toolbar
         left={
-          <span className="kw-secondary-text">合并说法重复的记忆，很久没提的降低优先级，到期的归档；每天也会自动整理一次。</span>
+          <span className="kw-secondary-text">
+            合并说法重复的记忆，很久没提的降低优先级，到期的归档；每天也会自动整理一次。
+            {active > cap - 20 ? ` 生效中已接近上限（${active}/${cap}），建议整理或删几条。` : ''}
+          </span>
         }
         right={
           <>
-            <Button color="secondary" onClick={() => organize.mutate()} disabled={organize.isPending}>
+            <Button
+              color="secondary"
+              onClick={() => organize.mutate()}
+              disabled={organize.isPending || !canEdit || workspaceId === null}
+            >
               立即整理
             </Button>
             <Button color="secondary" onClick={() => void exportAll()}>导出</Button>
             <Button color="danger" onClick={() => setClearing(true)}>
               清空
             </Button>
-            <Button color="primary" onClick={() => setAdding(true)}>
-              <Plus />
-              添加记忆
-            </Button>
+            {canEdit ? (
+              <Button color="primary" onClick={() => setAdding(true)}>
+                <Plus />
+                添加记忆
+              </Button>
+            ) : null}
           </>
         }
       />

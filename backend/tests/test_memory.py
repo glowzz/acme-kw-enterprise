@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 
 import pgserver
 import pytest
+from fastapi import FastAPI
 from knowwork_server.db.base import Base
 from knowwork_server.identity.models import User
 from sqlalchemy import func, select, text
@@ -32,7 +33,7 @@ from acme.kw_enterprise.memory.models import (
     Memory,
     MemorySetting,
 )
-from acme.kw_enterprise.memory.service import Conflict, Denied, Invalid, MemoryService, NotFound
+from acme.kw_enterprise.memory.service import Conflict, Denied, Invalid, MemoryError, MemoryService, NotFound
 
 pytestmark = pytest.mark.anyio
 
@@ -322,6 +323,119 @@ async def test_export_and_clear(sessionmaker, service):
     async with sessionmaker() as session:
         remaining = await session.scalar(select(func.count()).select_from(MemorySetting))
     assert int(remaining) == 0
+
+
+# ---- 路由层：状态码映射与请求体校验（stub service，不起真实依赖） ----
+
+
+def _http_app(service) -> FastAPI:
+    from acme.kw_enterprise.memory import api as memory_api
+
+    class Ctx:  # 最小上下文：身份固定 u1，其余字段只求装配通过
+        def principal(self, scope):
+            async def who():
+                from knowwork_server.auth.principal import Principal
+
+                return Principal(user_id="u1", auth_method="session")
+
+            return who
+
+        global_sessionmaker = None
+        access = None
+
+    app = FastAPI()
+    for router in memory_api.build_routers(Ctx(), service=service):
+        app.include_router(router)
+    return app
+
+
+class StubService:
+    """路由层替身：error 非空时任何方法都抛它，验证 _call 的映射；为空时返回最小合法值。"""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+
+    def _raise(self) -> None:
+        if self.error is not None:
+            raise self.error
+
+    async def add(self, user_id, *, type, content):
+        self._raise()
+        return {"id": "mem_" + "0" * 32, "status": "active"}
+
+    async def delete(self, user_id, memory_id):
+        self._raise()
+
+    async def confirm(self, user_id, memory_id):
+        self._raise()
+        return {}
+
+    async def dismiss(self, user_id, memory_id):
+        self._raise()
+
+    async def restore(self, user_id, memory_id):
+        self._raise()
+        return {}
+
+    async def counts(self, user_id):
+        self._raise()
+        return {"active": 0, "pending": 0, "superseded": 0, "archived": 0, "cap": 200}
+
+    async def organize(self, user_id, workspace_id):
+        self._raise()
+        return "job_1"
+
+    async def clear(self, user_id):
+        self._raise()
+        return 0
+
+    async def setting(self, user_id):
+        self._raise()
+        return {"enabled": True}
+
+    async def set_setting(self, user_id, enabled):
+        self._raise()
+        return {"enabled": enabled}
+
+    async def workspace_setting(self, actor_id, workspace_id):
+        self._raise()
+        return {"disabled": False}
+
+    async def set_workspace_setting(self, actor_id, workspace_id, disabled):
+        self._raise()
+        return {"disabled": disabled}
+
+
+def test_error_status_mapping():
+    """服务层异常 → HTTP：403/404/409/422，其余 MemoryError 400（不逃成 500）。"""
+    from fastapi.testclient import TestClient
+
+    cases = [(Denied("x"), 403), (NotFound("x"), 404), (Conflict("x"), 409), (Invalid("x"), 422),
+             (MemoryError("x"), 400)]
+    for error, status in cases:
+        client = TestClient(_http_app(StubService(error)))
+        response = client.post("/api/memory", json={"type": "fact", "content": "内容"})
+        assert response.status_code == status, f"{type(error).__name__} → {response.status_code}"
+
+
+def test_route_shapes():
+    """201/202/204/200 的形状、MemoryId 路径模式与请求体校验（422）。"""
+    from fastapi.testclient import TestClient
+
+    client = TestClient(_http_app(StubService()))
+    assert client.post("/api/memory", json={"type": "fact", "content": "内容"}).status_code == 201
+    assert client.post("/api/memory/organize", json={"workspaceId": "ws"}).status_code == 202
+    assert client.post("/api/memory/clear").status_code == 204
+    assert client.post(f"/api/memory/{'mem_' + '0' * 32}/dismiss").status_code == 204
+    assert client.put("/api/workspaces/ws/memory-setting", json={"disabled": True}).status_code == 200
+    assert client.get("/api/workspaces/ws/memory-setting").status_code == 200
+    assert client.get("/api/memory/counts").status_code == 200
+    # memory_id 不合模式 → 422（路径校验），不会 404 误当「没有这条」
+    assert client.patch("/api/memory/not-a-memory-id", json={"content": "x"}).status_code == 422
+    assert client.post("/api/memory", json={"type": "fact", "content": "x" * 501}).status_code == 422
+    # 纯空白在服务层拦（_content_of，test_add_validates_content 覆盖），路由只校验枚举与长度
+    assert client.post("/api/memory", json={"type": "odd", "content": "x"}).status_code == 422
+    assert client.post("/api/memory/organize", json={"workspaceId": "含空格 不行"}).status_code == 422
 
 
 # ---- 迁移分支：全新空库上升降 ----

@@ -68,8 +68,9 @@ class WorkspaceSettingBody(BaseModel):
     disabled: bool
 
 
-def build_routers(ctx) -> list[APIRouter]:
-    service = MemoryService(ctx.global_sessionmaker, ctx.access)
+def build_routers(ctx, service: MemoryService | None = None) -> list[APIRouter]:
+    """装配记忆路由；service 参数给测试注入替身用（不传按真实依赖构建）。"""
+    service = service or MemoryService(ctx.global_sessionmaker, ctx.access)
     router = APIRouter(prefix="/api/memory", tags=["记忆"])
     workspace_router = APIRouter(prefix="/api/workspaces/{workspace_id}", tags=["记忆"])
     Who = Annotated[Principal, Depends(ctx.principal(None))]

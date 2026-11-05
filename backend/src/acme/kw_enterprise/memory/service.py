@@ -13,6 +13,7 @@ from typing import Any
 from knowwork_server.access.rls import set_workspace
 from knowwork_server.jobs.queue import enqueue
 from sqlalchemy import delete, func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from .jobs import ORGANIZE
@@ -101,7 +102,10 @@ class MemoryService:
     # ---- 增删改（M1 的来源都是本人：手动添加） ----
 
     async def add(self, user_id: str, *, type: str, content: str) -> dict[str, Any]:
-        """手动添加：本人添加本人负责，直接生效。在办事项给默认期限，编辑里可改。"""
+        """手动添加：本人添加本人负责，直接生效。在办事项给默认期限，编辑里可改。
+        个人开关关闭时后端也拦（设计 §9：关闭后助手不再读取或新增）。"""
+        if not (await self.setting(user_id))["enabled"]:
+            raise Conflict("个人记忆已关闭，先在设置里打开再添加")
         content = _content_of(content)
         async with self._sessionmaker() as session, session.begin():
             await _require_capacity(session, user_id)
@@ -199,13 +203,12 @@ class MemoryService:
         return {"enabled": row.enabled if row is not None else True}
 
     async def set_setting(self, user_id: str, enabled: bool) -> dict[str, Any]:
-        """关闭只停链路（注入给空、提取停、工具不给），数据保留——重新打开接着用（设计 §1）。"""
+        """关闭只停链路（注入给空、提取停、工具不给），数据保留——重新打开接着用（设计 §1）。
+        upsert 写法：两个并发的「首次保存」都查不到行时，普通的 get+insert 会撞主键 500。"""
         async with self._sessionmaker() as session, session.begin():
-            row = await session.get(MemorySetting, user_id)
-            if row is None:
-                session.add(MemorySetting(user_id=user_id, enabled=enabled))
-            else:
-                row.enabled = enabled
+            statement = pg_insert(MemorySetting).values(user_id=user_id, enabled=enabled)
+            await session.execute(statement.on_conflict_do_update(
+                index_elements=[MemorySetting.user_id], set_={"enabled": statement.excluded.enabled}))
         return {"enabled": enabled}
 
     async def workspace_setting(self, actor_id: str, workspace_id: str) -> dict[str, Any]:
@@ -227,11 +230,11 @@ class MemoryService:
         if self._access is None or not await self._access.check(actor_id, workspace_id, "workspace", "edit"):
             raise Denied("只有空间管理员可以停用本空间的记忆")
         async with self._sessionmaker() as session, session.begin():
-            row = await session.get(MemoryWorkspaceSetting, workspace_id)
-            if row is None:
-                session.add(MemoryWorkspaceSetting(workspace_id=workspace_id, disabled=disabled))
-            else:
-                row.disabled = disabled
+            statement = pg_insert(MemoryWorkspaceSetting).values(
+                workspace_id=workspace_id, disabled=disabled)
+            await session.execute(statement.on_conflict_do_update(
+                index_elements=[MemoryWorkspaceSetting.workspace_id],
+                set_={"disabled": statement.excluded.disabled}))
         return {"disabled": disabled}
 
     # ---- 导出与清空 ----
