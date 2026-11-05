@@ -177,13 +177,17 @@ async def test_restore_refreshes_expired_task(sessionmaker, service):
 
 
 async def test_restore_superseded_archives_successor(sessionmaker, service):
-    """恢复「已被更新」的旧版本时，取代它的那条归档：新旧互斥，不同时注入。"""
+    """恢复「已被更新」的旧版本时，取代它的那条降为 SUPERSEDED 并指回本行：新旧互斥，不同时注入。
+    （后继落 SUPERSEDED 而非 ARCHIVED：语义是「被旧版取代」，页签角标也按这个口径，R5 定。）"""
     new_id = await _insert(sessionmaker, "u1", status=ACTIVE)
     old_id = await _insert(sessionmaker, "u1", status=SUPERSEDED, superseded_by=new_id)
     restored = await service.restore("u1", old_id)
     assert restored["status"] == ACTIVE and restored["supersededBy"] is None
     statuses = {item["id"]: item["status"] for item in await service.export("u1")}
-    assert statuses[new_id] == ARCHIVED and statuses[old_id] == ACTIVE
+    assert statuses[new_id] == SUPERSEDED and statuses[old_id] == ACTIVE
+    async with sessionmaker() as session:  # 指针回写是往返互斥的关键：后继要能找到本行
+        successor = await session.get(Memory, new_id)
+        assert successor is not None and successor.superseded_by == old_id
 
 
 async def test_delete_is_scoped_to_owner(sessionmaker, service):
@@ -370,27 +374,30 @@ async def test_export_and_clear(sessionmaker, service):
 
 
 async def test_restore_superseded_is_capacity_neutral(sessionmaker, service):
-    """恢复「已被更新」净变化为零（后继归档、本行激活）：满额时不该误报 409。"""
-    superseded = await _insert(sessionmaker, "u1", status=SUPERSEDED)
-    await _insert(sessionmaker, "u1", status=ACTIVE, superseded_by=superseded)
-    async with sessionmaker() as session, session.begin():  # 凑满 200 生效中
+    """恢复「已被更新」净变化为零（后继降级、本行激活）：满额时不该误报 409。
+    形状取系统真正会产生的正向链：SUPERSEDED 行指向 ACTIVE 后继（R5：上一版造的
+    ACTIVE 带指针的形状在状态机里不可达，验证的是假想分支）。"""
+    successor = await _insert(sessionmaker, "u1", status=ACTIVE)
+    superseded = await _insert(sessionmaker, "u1", status=SUPERSEDED, superseded_by=successor)
+    async with sessionmaker() as session, session.begin():  # 加上后继凑满 200 生效中
         session.add_all(Memory(id=f"mem_{uuid.uuid4().hex}", user_id="u1", type=FACT,
                                content=f"凑数 {index}", status=ACTIVE)
                         for index in range(ACTIVE_CAP - 1))
-    restored = await service.restore("u1", superseded)  # 后继先归档腾出一席，恢复不该撞满额
+    restored = await service.restore("u1", superseded)  # 后继先降级腾出一席，恢复不该撞满额
     assert restored["status"] == ACTIVE
 
 
 async def test_restore_round_trip_stays_exclusive(sessionmaker, service):
-    """恢复是双向互斥的：旧版复活后，再恢复被归档的后继时旧版要让位，矛盾对永远只有一个生效。"""
+    """往返恢复后恰好一条 ACTIVE：靠的是后继降级时回写指针——后继将来恢复时靠它找到本行
+    （R5 纠正归因：正向链 + 指针回写就够，不是「双向查询」）。"""
     new_id = await _insert(sessionmaker, "u1", status=ACTIVE, content="新版表述")
     old_id = await _insert(sessionmaker, "u1", status=SUPERSEDED, content="旧版表述", superseded_by=new_id)
-    await service.restore("u1", old_id)   # 旧版复活、新版归档（R3 用例）
-    # 再恢复新版：旧版要让位（R4：单向互斥会在这里复活两条）
+    await service.restore("u1", old_id)   # 旧版复活、新版降为 SUPERSEDED 且指向旧版
+    # 再恢复新版：正向链命中旧版（ACTIVE），旧版让位
     restored_back = await service.restore("u1", new_id)
     assert restored_back["status"] == ACTIVE
     statuses = {item["id"]: item["status"] for item in await service.export("u1")}
-    assert statuses[new_id] == ACTIVE and statuses[old_id] == ARCHIVED
+    assert statuses[new_id] == ACTIVE and statuses[old_id] == SUPERSEDED
 
 
 # ---- 路由层：状态码映射与请求体校验（stub service，不起真实依赖） ----

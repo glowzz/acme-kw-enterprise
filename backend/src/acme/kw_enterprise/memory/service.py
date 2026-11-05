@@ -169,20 +169,21 @@ class MemoryService:
     async def restore(self, user_id: str, memory_id: str) -> dict[str, Any]:
         """已归档 / 已被更新 → 生效中；满额 409（提示先删几条）。
 
-        两个连带语义（R3 审查补）：
-        - 恢复是否认它的全部后继（R4 审查补的双向互斥）：沿取代链正向（superseded_by）与反向
-          （谁指向我）找到仍然生效的后继，全部归档并指回本行——只做单向的话，恢复后继会把
-          矛盾的一对同时复活；
-        - 链处理是容量中性的（归档若干、激活一条），所以先做互斥再查容量，容量中性的恢复不会误报满额；
-        - 过期归档的在办事项恢复 = 再给一个默认期限窗口，不然一恢复下一次整理又把它归档，等于白点。"""
+        连带语义（R3-R5 审查逐步补齐）：
+        - 恢复是否认它的全部后继：沿取代链（superseded_by 正向）把仍然生效的后继降为
+          SUPERSEDED 并把指针指回本行。**指针回写是往返互斥的关键**——后继将来恢复时靠它
+          找到本行，没有它，恢复后继会把矛盾的一对同时复活；顺链遍历盖住链式情形
+          （后继自身又被更新的那种）。
+        - 本行是唯一的多行读-改-写路径：与满额判定共用同一把 advisory 事务锁，两个并发恢复
+          不会把同一个后继各自降级、互相覆盖指针（那会永久断链）。
+        - 链处理是容量中性的（降级若干、激活一条），所以先做互斥再查容量，不会误报满额；
+        - 过期归档的在办事项恢复 = 再给一个默认期限窗口，不然一恢复下一次整理又把它归档。"""
         async with self._sessionmaker() as session, session.begin():
             row = await _owned(session, user_id, memory_id)
             if row.status not in (ARCHIVED, SUPERSEDED):
                 raise Conflict("只有已归档或已被更新的记忆可以恢复")
+            await _acquire_capacity_lock(session, user_id)  # 后继的读-改-写也要在锁内（R5）
             chain = [row.superseded_by] if row.superseded_by else []
-            pointed = await session.scalars(select(Memory.id).where(
-                Memory.user_id == user_id, Memory.superseded_by == row.id, Memory.status == ACTIVE))
-            chain.extend(pointed)
             seen: set[str] = set()
             while chain:
                 successor_id = chain.pop()
@@ -192,11 +193,12 @@ class MemoryService:
                 successor = await session.get(Memory, successor_id)
                 if successor is None or successor.user_id != user_id:
                     continue
+                next_pointer = successor.superseded_by  # 先取原指针再覆写，续链不断（R5）
                 if successor.status == ACTIVE:
-                    successor.status = ARCHIVED
-                    successor.superseded_by = row.id  # 指回本行：将来恢复它时找得到对手
-                if successor.superseded_by and successor.superseded_by != row.id:
-                    chain.append(successor.superseded_by)
+                    successor.status = SUPERSEDED  # 语义是「被本行取代」，不是归档（贴合 §3 与页签角标）
+                    successor.superseded_by = row.id
+                if next_pointer and next_pointer != row.id:
+                    chain.append(next_pointer)
             await _require_capacity(session, user_id)
             if row.type == TASK and row.expires_at is not None and row.expires_at <= _now():
                 row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
@@ -303,11 +305,16 @@ async def _owned(session, user_id: str, memory_id: str) -> Memory:
     return row
 
 
-async def _require_capacity(session, user_id: str) -> None:
-    """生效满额判定：先拿这个用户的 advisory 事务锁再 count——普通 SELECT count 不加锁，
-    READ COMMITTED 下两个并发事务能各自数到 199 再各插一条，把 active 顶过 200；
-    锁把同一用户的「查+写」串行化，事务结束自动释放（设计 §8 的承诺靠它兑现）。"""
+async def _acquire_capacity_lock(session, user_id: str) -> None:
+    """同一用户的 advisory 事务锁：恢复的跨行读-改-写与满额「查+写」共用一把，
+    同一用户的并发操作在此串行化，事务结束自动释放（对同会话同 key 可重入）。"""
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:uid))"), {"uid": user_id})
+
+
+async def _require_capacity(session, user_id: str) -> None:
+    """生效满额判定：锁后 count——普通 SELECT count 不加锁，READ COMMITTED 下两个并发事务能
+    各自数到 199 再各插一条，把 active 顶过 200（设计 §8 的承诺靠锁兑现）。"""
+    await _acquire_capacity_lock(session, user_id)
     active = await session.scalar(select(func.count()).select_from(Memory)
                                   .where(Memory.user_id == user_id, Memory.status == ACTIVE))
     if int(active or 0) >= ACTIVE_CAP:
