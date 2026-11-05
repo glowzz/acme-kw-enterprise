@@ -7,22 +7,25 @@
 
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from knowwork_server.access.rls import set_workspace
 from knowwork_server.jobs.queue import enqueue
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from .jobs import ORGANIZE
+from .jobs import EXTRACT, ORGANIZE
 from .models import (
     ACTIVE,
     ACTIVE_CAP,
+    ACTIVE_CONFIDENCE,
     ARCHIVED,
     BY_USER,
     CONTENT_MAX,
+    EXTRACTED,
     PENDING,
     SUPERSEDED,
     TASK,
@@ -64,6 +67,7 @@ def _now() -> datetime:
 def _view(row: Memory) -> dict[str, Any]:
     """给前端的形态：camelCase，同 web/src/api 的惯例。embedding 不出接口（内部字段）。"""
     return {"id": row.id, "type": row.type, "content": row.content, "quote": row.quote,
+            "originWorkspaceId": row.origin_workspace_id,
             "source": row.source, "status": row.status, "score": row.score,
             "mentionCount": row.mention_count, "lastMentionedAt": row.last_mentioned_at,
             "expiresAt": row.expires_at, "supersededBy": row.superseded_by,
@@ -221,7 +225,7 @@ class MemoryService:
             raise Denied("只有本空间成员可以整理自己的记忆")
         if not (await self.setting(user_id))["enabled"]:
             raise Conflict("个人记忆已关闭，先在设置里打开再整理")
-        if (await self._workspace_disabled(workspace_id))["disabled"]:
+        if (await self.workspace_disabled(workspace_id))["disabled"]:
             raise Conflict("本空间已停用记忆，整理暂不执行")
         async with self._sessionmaker() as session, session.begin():
             await set_workspace(session, workspace_id)  # job 表在 RLS 名单里
@@ -234,7 +238,13 @@ class MemoryService:
     async def setting(self, user_id: str) -> dict[str, Any]:
         async with self._sessionmaker() as session:
             row = await session.get(MemorySetting, user_id)
-        return {"enabled": row.enabled if row is not None else True}
+        return {"enabled": row.enabled if row is not None else True,
+                "lastOrganizedAt": row.last_organized_at if row is not None else None}
+
+    async def last_organized_on(self, user_id: str) -> str | None:
+        """上次整理的日期（本地口径由调用方定）：提供者判断「今天整理过没有」用。"""
+        value = (await self.setting(user_id))["lastOrganizedAt"]
+        return value.date().isoformat() if value is not None else None
 
     async def set_setting(self, user_id: str, enabled: bool) -> dict[str, Any]:
         """关闭只停链路（注入给空、提取停、工具不给），数据保留——重新打开接着用（设计 §1）。
@@ -252,10 +262,11 @@ class MemoryService:
         不给外人探测任意空间开关状态的口子。"""
         if self._access is None or not await self._access.check(actor_id, workspace_id, "workspace", "use"):
             raise Denied("只有本空间成员可以查看本空间的记忆开关")
-        return await self._workspace_disabled(workspace_id)
+        return await self.workspace_disabled(workspace_id)
 
-    async def _workspace_disabled(self, workspace_id: str) -> dict[str, Any]:
-        """开关的原始读取（不判权）：内部链路（organize 的闸、M2 的提供者）复用。"""
+    async def workspace_disabled(self, workspace_id: str) -> dict[str, Any]:
+        """开关的原始读取（不判权）：内部链路（organize 的闸、提供者、worker 存量任务复查）复用。
+        外部路由一律走 workspace_setting(actor, ws)，判权在那一层。"""
         async with self._sessionmaker() as session:
             row = await session.get(MemoryWorkspaceSetting, workspace_id)
         return {"disabled": row.disabled if row is not None else False}
@@ -273,6 +284,109 @@ class MemoryService:
                 index_elements=[MemoryWorkspaceSetting.workspace_id],
                 set_={"disabled": statement.excluded.disabled, "updated_at": func.now()}))
         return {"disabled": disabled}
+
+    # ---- M2：注入与提取链路用的原语 ----
+
+    async def active_snapshot(self, user_id: str) -> list[dict[str, Any]]:
+        """生效中的全部记忆（≤200 行），给提供者一次读全：standing 直接用、turn 段算余弦。
+        embedding 原样带出（没算过的为 None）。"""
+        async with self._sessionmaker() as session:
+            rows = await session.scalars(select(Memory).where(Memory.user_id == user_id,
+                                                              Memory.status == ACTIVE)
+                                          .order_by(Memory.score.desc(), Memory.id))
+            return [{"id": row.id, "type": row.type, "content": row.content,
+                     "score": row.score, "embedding": row.embedding,
+                     "expiresAt": row.expires_at} for row in rows]
+
+    async def dedup_pool(self, user_id: str) -> list[dict[str, Any]]:
+        """判重的比对池：生效中 + 待确认的记忆（id/内容/向量）。提取落库前对它算签名、
+        否定极性与余弦；归档与已被更新的不参与（它们不会再注入）。"""
+        async with self._sessionmaker() as session:
+            rows = await session.scalars(select(Memory).where(
+                Memory.user_id == user_id, Memory.status.in_((ACTIVE, PENDING))))
+            return [{"id": row.id, "content": row.content, "status": row.status,
+                     "embedding": row.embedding} for row in rows]
+
+    async def track_mentions(self, user_id: str, memory_ids: Sequence[str]) -> None:
+        """记账只记 turn 段命中的条目（standing 常驻不算提及——按「在场」记账会让衰减永不触发，
+        设计 §4）。fire-and-forget：由提供者放后台任务、吞异常。"""
+        ids = list(dict.fromkeys(memory_ids))
+        if not ids:
+            return
+        async with self._sessionmaker() as session, session.begin():
+            await session.execute(update(Memory).where(Memory.user_id == user_id, Memory.id.in_(ids))
+                                  .values(mention_count=Memory.mention_count + 1,
+                                          last_mentioned_at=func.now()))
+
+    async def enqueue_extract(self, user_id: str, workspace_id: str, conversation_id: str, turn: int,
+                              question: str, answer: str) -> str:
+        """回合结束排提取任务（on_turn_ended 的贡献者调）。subject=conversation_id：同一会话连续
+        几轮合并成一条、载荷换最新；载荷自带回答全文（run_summary 不存）。job 表在 RLS 名单里。"""
+        async with self._sessionmaker() as session, session.begin():
+            await set_workspace(session, workspace_id)
+            return await enqueue(session, EXTRACT, workspace_id=workspace_id, subject_id=conversation_id,
+                                 payload={"user_id": user_id, "conversation_id": conversation_id,
+                                          "turn": turn, "question": question[:2000],
+                                          "answer": answer[:6000]})
+
+    async def store_extract(self, user_id: str, workspace_id: str,
+                            rows: Sequence[dict[str, Any]]) -> dict[str, int]:
+        """提取候选落库（extract.py 已把规则判重、相似度、LLM 判定算完，这里只应用结果）。
+
+        每行：{type, content, quote, confidence, embedding, embedding_model,
+               action: "insert"|"update"|"replace", target: 目标记忆 id}。
+        - update：改写目标记忆的内容（id 不变、记账 +1、向量按候选的换）；
+        - replace：目标降为 superseded（指向新行）、新行入库；
+        - insert：置信 ≥0.8 且有 quote 直接生效，否则待确认；满额不报错——降为待确认
+          （M2 无腾位，M3 的整理腾出位置后用户可手动确认）。
+        返回 {active, pending, updated, replaced, dropped} 给 facts 与日志。"""
+        now = _now()
+        counts = {"active": 0, "pending": 0, "updated": 0, "replaced": 0, "dropped": 0}
+        async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)
+            for item in rows:
+                content = _content_of(item["content"])
+                action, target = item.get("action", "insert"), item.get("target")
+                base = {"type": item["type"], "content": content, "quote": item.get("quote", ""),
+                        "origin_workspace_id": workspace_id, "embedding": item.get("embedding"),
+                        "embedding_model": item.get("embedding_model")}
+                if action == "update" and target:
+                    row = await session.get(Memory, target)
+                    if row is None or row.user_id != user_id or row.status != ACTIVE:
+                        counts["dropped"] += 1
+                        continue
+                    row.content = content
+                    row.quote = base["quote"] or row.quote
+                    row.type = base["type"]
+                    row.embedding = base["embedding"]      # 改写后的内容配候选的向量
+                    row.embedding_model = base["embedding_model"]
+                    if base["type"] == TASK:
+                        row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
+                    row.mention_count += 1
+                    row.last_mentioned_at = now
+                    counts["updated"] += 1
+                    continue
+                new_id = f"mem_{uuid.uuid4().hex}"
+                if action == "replace" and target:
+                    old = await session.get(Memory, target)
+                    if old is not None and old.user_id == user_id and old.status == ACTIVE:
+                        old.status = SUPERSEDED
+                        old.superseded_by = new_id
+                        counts["replaced"] += 1
+                confident = item.get("confidence", 0.0) >= ACTIVE_CONFIDENCE and bool(base["quote"])
+                status = ACTIVE if confident else PENDING
+                if status == ACTIVE:
+                    active_count = await session.scalar(select(func.count()).select_from(Memory)
+                                                        .where(Memory.user_id == user_id,
+                                                               Memory.status == ACTIVE))
+                    if int(active_count or 0) >= ACTIVE_CAP:
+                        status = PENDING  # M2 无腾位：满额先进待确认，M3 整理腾位后可手动确认
+                session.add(Memory(
+                    id=new_id, user_id=user_id, status=status, source=EXTRACTED,
+                    expires_at=_now() + timedelta(days=TASK_TTL_DAYS) if base["type"] == TASK else None,
+                    **base))
+                counts["active" if status == ACTIVE else "pending"] += 1
+        return counts
 
     # ---- 导出与清空 ----
 

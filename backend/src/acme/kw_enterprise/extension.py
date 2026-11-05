@@ -2,8 +2,9 @@
 
 合同见 knowwork_server.extensions.contract。一期是纯胶水：三个路由组（空间管理、企业技能、
 企业 MCP）的存储全部在开源服务里。M1 起带记忆层：三张自己的表（memory.models，全局表不进
-RLS）、一条自己的迁移分支、路由挂 /api/memory 与空间开关；提取与注入在 M2/M3 接
-（turn_context / on_turn_ended / setup_worker 的接缝留给那时用）。
+RLS）、一条自己的迁移分支、路由挂 /api/memory 与空间开关。M2 起接注入与提取：
+turn_context.add（v0.0.6 起多提供者，按登记顺序拼）登记提供者，on_turn_ended 排提取任务，
+setup_worker 注册 memory.extract 的 handler。
 装配出错时 KnowWork 会把整个扩展去掉并记原因（contract 的约定），所以这里不做局部兜底。
 """
 
@@ -13,6 +14,10 @@ from typing import Any
 from . import mcp_api, skills_api, workspaces_api
 from .license import MODULE
 from .memory import api as memory_api
+from .memory import extract as memory_extract
+from .memory.context import MemoryContext
+from .memory.jobs import EXTRACT
+from .memory.service import MemoryService
 
 # 记忆层的迁移分支：装包就升级，不看授权（contract 的约定）
 MEMORY_MIGRATIONS = Path(__file__).with_name("memory_migrations")
@@ -26,19 +31,27 @@ class Enterprise:
     migrations = MEMORY_MIGRATIONS
 
     def setup_api(self, ctx: Any):
-        """业务服务启动时装配：返回挂到公开端口的路由。"""
+        """业务服务启动时装配：路由 + 每轮上下文提供者 + 回合结束的提取入队。
+        MemoryService 三处共用一份（路由 / 提供者 / 贡献者），装配期构造一次。"""
+        service = MemoryService(ctx.global_sessionmaker, ctx.access)
+        context = MemoryContext(service, ctx.models, ctx.profiles)
+        ctx.turn_context.add(context.provider)  # v0.0.6：多提供者按登记顺序拼，出错整轮不带
+        ctx.on_turn_ended("memory", memory_extract.build_contributor(service, ctx.profiles))
         return [workspaces_api.build_router(ctx),
                 skills_api.build_router(ctx),
                 mcp_api.build_router(ctx),
-                *memory_api.build_routers(ctx)]
+                *memory_api.build_routers(ctx, service=service)]
 
     def setup_internal(self, ctx: Any):
         """内部端口路由：没有；保留方法体让以后加扩展服务回调时不用动装配。"""
         return []
 
     def setup_worker(self, ctx: Any) -> None:
-        """worker 启动时注册后台任务：记忆的提取/整理 handler 在 M2/M3 注册（任务类型已在
-        memory.jobs 钉死口径，api 侧已可入队）。"""
+        """worker 注册 memory.extract：模型别名按空间解析（环境变量可钉），没配模型时
+        handler 记日志收尾（注入不依赖提取，用户无感）。"""
+        service = MemoryService(ctx.sessionmaker)
+        ctx.runner.register(EXTRACT, memory_extract.build_extract_handler(service, ctx.models),
+                            on_give_up=memory_extract.log_give_up)
 
     async def start(self) -> None:
         """开始服务前调用：没有要预热的数据。"""

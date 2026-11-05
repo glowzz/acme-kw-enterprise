@@ -277,9 +277,9 @@ async def test_views_survive_strict_sessionmaker(sessionmaker, pg_url):
 
 
 async def test_personal_setting_defaults_to_enabled(sessionmaker, service):
-    assert await service.setting("u1") == {"enabled": True}   # 没有行 = 开启
+    assert (await service.setting("u1"))["enabled"] is True    # 没有行 = 开启
     assert await service.set_setting("u1", False) == {"enabled": False}
-    assert await service.setting("u1") == {"enabled": False}
+    assert (await service.setting("u1"))["enabled"] is False
     assert await service.set_setting("u1", True) == {"enabled": True}
 
 
@@ -366,7 +366,7 @@ async def test_export_and_clear(sessionmaker, service):
     assert await service.clear("u1") == 2
     assert await service.export("u1") == []
     assert len(await service.export("u2")) == 1              # 只清本人的
-    assert await service.setting("u1") == {"enabled": True}  # 个人开关一并复位
+    assert (await service.setting("u1"))["enabled"] is True  # 个人开关一并复位
 
     async with sessionmaker() as session:
         remaining = await session.scalar(select(func.count()).select_from(MemorySetting))

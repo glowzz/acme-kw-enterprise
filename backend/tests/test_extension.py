@@ -27,9 +27,21 @@ def test_contract_attributes() -> None:
     assert extension.migrations is not None and extension.migrations.is_dir(), "记忆走自己的迁移分支"
 
 
-def _build_app() -> FastAPI:
-    extension = installed_extensions().active[0]
+class _Recorder:
+    """装配期挂接点的替身：记录注册了什么（真实运行时由 ApiContext 提供）。
+    turn_context 用 .add，on_turn_ended 直接调用 contribute(名字, 函数)。"""
 
+    def __init__(self) -> None:
+        self.items: list = []
+
+    def add(self, item) -> None:
+        self.items.append(item)
+
+    def __call__(self, *args) -> None:
+        self.items.append(args)
+
+
+def _build_ctx():
     class Ctx:  # 最小上下文：只够装配路由（请求时的对象由真实运行时提供）
         def principal(self, scope):
             async def who():
@@ -44,9 +56,17 @@ def _build_app() -> FastAPI:
     ctx.enterprise_mcp = None  # type: ignore[attr-defined]
     ctx.access = None  # type: ignore[attr-defined]
     ctx.global_sessionmaker = None  # type: ignore[attr-defined]  记忆路由装配只存引用，请求时才用
+    ctx.models = None  # type: ignore[attr-defined]  M2 提供者只在运行期用
+    ctx.profiles = None  # type: ignore[attr-defined]
+    ctx.turn_context = _Recorder()  # type: ignore[attr-defined]  v0.0.6：多提供者 add
+    ctx.on_turn_ended = _Recorder()  # type: ignore[attr-defined]  contribute(名字, 函数)
+    return ctx
 
+
+def _build_app() -> FastAPI:
+    extension = installed_extensions().active[0]
     app = FastAPI()
-    for router in extension.setup_api(ctx):
+    for router in extension.setup_api(_build_ctx()):
         app.include_router(router)
     return app
 
@@ -106,7 +126,12 @@ def test_enterprise_mcp_routes() -> None:
 
 def test_memory_routes() -> None:
     """记忆层 M1 的全部路由：列表/统计/添加/整理/开关/导出/清空/单条操作 + 空间开关。"""
-    routes = _routes(_build_app())
+    ctx = _build_ctx()
+    extension = installed_extensions().active[0]
+    app = FastAPI()
+    for router in extension.setup_api(ctx):
+        app.include_router(router)
+    routes = _routes(app)
     memory_paths = {path for _, path in routes if path.startswith("/api/memory")}
     assert memory_paths >= {
         "/api/memory", "/api/memory/counts", "/api/memory/organize", "/api/memory/settings",
@@ -119,3 +144,26 @@ def test_memory_routes() -> None:
     assert ("PATCH", "/api/memory/{memory_id}") in routes
     assert ("GET", "/api/workspaces/{workspace_id}/memory-setting") in routes
     assert ("PUT", "/api/workspaces/{workspace_id}/memory-setting") in routes
+
+
+def test_memory_wiring() -> None:
+    """M2 的三个挂接点：每轮上下文提供者、回合结束的提取贡献者、worker 的提取任务。"""
+    ctx = _build_ctx()
+    extension = installed_extensions().active[0]
+    extension.setup_api(ctx)
+    assert len(ctx.turn_context.items) == 1, "登记了一个每轮上下文提供者（turn_context.add）"
+    assert ctx.on_turn_ended.items and ctx.on_turn_ended.items[0][0] == "memory", "贡献者挂在 memory 名下"
+
+    registered: dict = {}
+
+    class _Runner:
+        def register(self, kind, handler, on_give_up=None, on_retry=None) -> None:
+            registered[kind.name] = (handler, on_give_up)
+
+    class _WorkerCtx:
+        runner = _Runner()
+        sessionmaker = None
+        models = None
+
+    extension.setup_worker(_WorkerCtx())
+    assert "memory.extract" in registered

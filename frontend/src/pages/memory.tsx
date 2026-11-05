@@ -227,7 +227,18 @@ function MemoryList({
 
   const columns: readonly Column<MemoryItem>[] = [
     { key: 'type', title: '类型', width: 110, render: (m) => TYPE_LABELS[m.type] },
-    { key: 'content', title: '内容', ellipsis: true, render: (m) => m.content },
+    {
+      key: 'content',
+      title: '内容',
+      ellipsis: true,
+      // 待确认的候选带原话出处（提取链路的证据链）：判断「确认/忽略」先看依据
+      render: (m) => (
+        <div>
+          <div>{m.content}</div>
+          {m.quote ? <div className="kw-secondary-text">原话：{m.quote}</div> : null}
+        </div>
+      ),
+    },
     { key: 'source', title: '来源', width: 110, render: (m) => SOURCE_LABELS[m.source] ?? m.source },
     {
       key: 'createdAt',
