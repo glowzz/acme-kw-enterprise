@@ -95,8 +95,16 @@ function AddDialog({ onClose }: { readonly onClose: () => void }) {
 function EditDialog({ item, onClose }: { readonly item: MemoryItem; readonly onClose: () => void }) {
   const client = useQueryClient();
   const [content, setContent] = useState(item.content);
+  // 在办事项可改期限：日期输入只到天，按当天 00:00 (UTC) 提交给后端
+  const [deadline, setDeadline] = useState(
+    item.type === 'task' && item.expiresAt ? item.expiresAt.slice(0, 10) : '',
+  );
   const edit = useMutation({
-    mutationFn: () => editMemory(item.id, { content: content.trim(), type: item.type }),
+    mutationFn: () =>
+      editMemory(item.id, {
+        content: content.trim(),
+        ...(item.type === 'task' && deadline ? { expiresAt: `${deadline}T00:00:00Z` } : {}),
+      }),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: MEMORY_KEYS.counts });
       await client.invalidateQueries({ queryKey: MEMORY_KEYS.list(item.status) });
@@ -117,6 +125,13 @@ function EditDialog({ item, onClose }: { readonly item: MemoryItem; readonly onC
       <Field label="内容" required>
         {(id) => <Input id={id} value={content} maxLength={500} onChange={(e) => setContent(e.target.value)} />}
       </Field>
+      {item.type === 'task' ? (
+        <Field label="期限" help="到这天还没办完，整理时会归档这条在办事项">
+          {(id) => (
+            <Input id={id} type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)} />
+          )}
+        </Field>
+      ) : null}
     </Dialog>
   );
 }
@@ -167,6 +182,8 @@ function useMemoryAction(fn: (id: string) => Promise<unknown>, success: string, 
   });
 }
 
+const PAGE_SIZE = 50;
+
 function MemoryList({
   status,
   cap,
@@ -176,7 +193,12 @@ function MemoryList({
   readonly cap: number;
   readonly onEdit: (item: MemoryItem) => void;
 }) {
-  const list = useQuery({ queryKey: MEMORY_KEYS.list(status), queryFn: () => listMemories(status) });
+  const [page, setPage] = useState(0);
+  // 只约束 active 的 200 上限管不住 pending/归档的增长：按页翻，别让第 201 条归档记忆消失
+  const list = useQuery({
+    queryKey: [...MEMORY_KEYS.list(status), page],
+    queryFn: () => listMemories(status, PAGE_SIZE, page * PAGE_SIZE),
+  });
   const confirm = useMemoryAction(confirmMemory, '已生效', status);
   const dismiss = useMemoryAction(dismissMemory, '已忽略', status);
   const restore = useMemoryAction(restoreMemory, '已恢复生效', status);
@@ -218,14 +240,37 @@ function MemoryList({
 
   if (list.isPending) return <Skeleton rows={4} />;
   if (list.isError) return <Empty title={readableError(list.error, '记忆列表没有加载出来')} />;
-  if (list.data.length === 0)
+  if (!list.data || list.data.items.length === 0)
     return (
       <Empty
         title={status === 'active' ? `还没有生效中的记忆（上限 ${cap} 条）` : '这一页暂无记忆'}
         description={status === 'active' ? '对话里说「记住…」或在上面手动添加。' : undefined}
       />
     );
-  return <Table<MemoryItem> rowKey={(m) => m.id} columns={columns} rows={list.data} minWidth={720} />;
+  const { items, total } = list.data;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  return (
+    <div className="kw-field-stack">
+      <Table<MemoryItem> rowKey={(m) => m.id} columns={columns} rows={items} minWidth={720} />
+      {pages > 1 ? (
+        <div className="kw-admin-toolbar">
+          <span className="kw-secondary-text">共 {total} 条，第 {page + 1}/{pages} 页</span>
+          <div className="kw-admin-toolbar-right">
+            <Button color="secondary" disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
+              上一页
+            </Button>
+            <Button
+              color="secondary"
+              disabled={page + 1 >= pages}
+              onClick={() => setPage((p) => Math.min(pages - 1, p + 1))}
+            >
+              下一页
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 export function MemoryTab() {
@@ -253,7 +298,8 @@ export function MemoryTab() {
   });
   const organize = useMutation({
     mutationFn: () => organizeNow(workspaceId ?? ''),
-    onSuccess: () => toast.success('已开始整理，稍候页面会反映结果'),
+    // handler 在 M3 注册：M1 只入队，措辞照实说，不承诺立刻有结果
+    onSuccess: () => toast.success('已排入整理队列，整理完成后列表会更新'),
     onError: (error) => toast.error(readableError(error, '没有排上整理任务')),
   });
   const exportAll = async () => {

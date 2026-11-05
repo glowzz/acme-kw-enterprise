@@ -30,7 +30,7 @@ class Enterprise:
         return [workspaces_api.build_router(ctx),
                 skills_api.build_router(ctx),
                 mcp_api.build_router(ctx),
-                memory_api.build_router(ctx)]
+                *memory_api.build_routers(ctx)]
 
     def setup_internal(self, ctx: Any):
         """内部端口路由：没有；保留方法体让以后加扩展服务回调时不用动装配。"""

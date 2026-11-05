@@ -89,11 +89,15 @@ async def sessionmaker(pg_url):
 
 @pytest.fixture
 def service(sessionmaker):
-    return MemoryService(sessionmaker)
+    """默认给放行的假 AccessService：organize 与空间开关读取都要判成员。"""
+    return MemoryService(sessionmaker, FakeAccess())
 
 
 class FakeAccess:
-    """AccessService 的假件：check(user, workspace, resource, action)。"""
+    """AccessService 的假件：check(user, workspace, resource, action)。
+
+    上游契约是「输入不合法或判定出错一律为 False」（core.py:152），永远返回 bool 不抛异常，
+    所以这里不复现抛错路径。"""
 
     def __init__(self, allowed: bool = True) -> None:
         self.allowed = allowed
@@ -146,6 +150,8 @@ async def test_edit_clears_embedding_and_sets_task_ttl(sessionmaker, service):
     assert switched["expiresAt"] is not None  # 改成在办事项时补默认期限
     deadline = await service.edit("u1", added["id"], expires_at=datetime(2026, 12, 1, tzinfo=UTC))
     assert deadline["expiresAt"] == datetime(2026, 12, 1, tzinfo=UTC)
+    back = await service.edit("u1", added["id"], type=FACT)
+    assert back["expiresAt"] is None  # 改走别的类型就摘期限，别让整理误归档
 
 
 async def test_delete_is_scoped_to_owner(sessionmaker, service):
@@ -196,7 +202,7 @@ async def test_restore_from_archived_and_superseded(sessionmaker, service):
 
 
 async def test_capacity_is_enforced(sessionmaker, service):
-    """满额 200：第 201 条进不来（判定与写入同一事务，并发也顶不破——这里只验行为）。"""
+    """满额 200：第 201 条进不来（advisory 事务锁 + 同事务 count，同一用户的查写被串行化）。"""
     async with sessionmaker() as session, session.begin():
         session.add_all(Memory(id=f"mem_{uuid.uuid4().hex}", user_id="u1", type=FACT,
                                content=f"批量记忆 {index}", status=ACTIVE)
@@ -206,6 +212,28 @@ async def test_capacity_is_enforced(sessionmaker, service):
     pending = await _insert(sessionmaker, "u1", status=PENDING)
     with pytest.raises(Conflict, match="200 条"):
         await service.confirm("u1", pending)
+
+
+async def test_views_survive_strict_sessionmaker(sessionmaker, pg_url):
+    """回归：写路由的视图在事务块内构造，不依赖 expire_on_commit=False
+    （真实装配是 make_sessionmaker 的 False，但服务不该耦合这个配置）。"""
+
+    name = f"mem_strict_{uuid.uuid4().hex[:8]}"
+    url = await _create_database(pg_url, name)
+    engine = create_async_engine(url)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    strict = async_sessionmaker(engine)  # 默认 expire_on_commit=True
+    async with strict() as session, session.begin():
+        session.add(User(id="u9", email="u9@example.com"))
+    service = MemoryService(strict, FakeAccess())
+    added = await service.add("u9", type=FACT, content="严格会话下的写入")
+    assert added["content"] == "严格会话下的写入"
+    edited = await service.edit("u9", added["id"], content="改一句话")
+    assert edited["content"] == "改一句话"
+    await engine.dispose()
+    await _drop_database(pg_url, name)
+
 
 
 # ---- 开关 ----
@@ -218,20 +246,28 @@ async def test_personal_setting_defaults_to_enabled(sessionmaker, service):
     assert await service.set_setting("u1", True) == {"enabled": True}
 
 
-async def test_workspace_setting_requires_admin(sessionmaker):
+async def test_workspace_setting_gates(sessionmaker):
+    """读要成员（use）、写要管理员（edit），判定都在服务层；没给 access 一律 403。"""
     access = FakeAccess(allowed=False)
     service = MemoryService(sessionmaker, access)
-    assert await service.workspace_setting("ws1") == {"disabled": False}  # 没有行 = 启用，任何成员可读
+    with pytest.raises(Denied):
+        await service.workspace_setting("u1", "ws1")  # 非成员读不到，别给外人探测的口子
 
+    access.allowed = True
+    assert await service.workspace_setting("u1", "ws1") == {"disabled": False}  # 没有行 = 启用
+
+    access.allowed = False
     with pytest.raises(Denied):
         await service.set_workspace_setting("u1", "ws1", True)
-    assert access.calls == [("u1", "ws1", "workspace", "edit")]  # 判定在服务层、只判 workspace:edit
+    assert access.calls[-1] == ("u1", "ws1", "workspace", "edit")  # 写判 edit（admin/owner 过）
 
     access.allowed = True
     assert await service.set_workspace_setting("u1", "ws1", True) == {"disabled": True}
-    assert await service.workspace_setting("ws1") == {"disabled": True}
+    assert await service.workspace_setting("u1", "ws1") == {"disabled": True}
 
     bare = MemoryService(sessionmaker)  # 没给 access：判不了宁可 403 不放过
+    with pytest.raises(Denied):
+        await bare.workspace_setting("u1", "ws1")
     with pytest.raises(Denied):
         await bare.set_workspace_setting("u1", "ws1", True)
 
@@ -247,6 +283,27 @@ async def test_organize_enqueues_merged_job(sessionmaker, service):
         job = (await session.execute(text("SELECT kind, status, payload FROM job"))).one()
     assert job.kind == "memory.organize" and job.status == "queued"
     assert job.payload == {"user_id": "u1", "workspace_id": "ws1"}  # workspace_id 供模型路由
+
+
+async def test_organize_is_gated(sessionmaker):
+    """入队三道闸：成员、个人开关、空间开关——都判在服务层。"""
+    access = FakeAccess(allowed=False)
+    service = MemoryService(sessionmaker, access)
+    with pytest.raises(Denied):
+        await service.organize("u1", "ws1")  # 非成员不能往这个空间的 job 表写
+
+    access.allowed = True
+    await service.set_setting("u1", False)
+    with pytest.raises(Conflict, match="个人记忆已关闭"):
+        await service.organize("u1", "ws1")
+
+    await service.set_setting("u1", True)
+    await service.set_workspace_setting("u1", "ws1", True)
+    with pytest.raises(Conflict, match="本空间已停用"):
+        await service.organize("u1", "ws1")
+
+    await service.set_workspace_setting("u1", "ws1", False)
+    assert await service.organize("u1", "ws1")
 
 
 async def test_export_and_clear(sessionmaker, service):

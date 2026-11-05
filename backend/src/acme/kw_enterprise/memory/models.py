@@ -49,7 +49,7 @@ class Memory(Base):
     )
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)  # mem_<uuid hex>，照 job_<hex> 的命名办法
-    user_id: Mapped[str] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(String(32), ForeignKey("user.id", ondelete="CASCADE"), index=True)
     type: Mapped[str] = mapped_column(String(16))
     content: Mapped[str] = mapped_column(Text)
     # 提取时的用户原话逐字摘录（应用层截断到 QUOTE_MAX）；手动添加/工具写入为空。
@@ -72,7 +72,9 @@ class Memory(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     superseded_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # onupdate 由 ORM 在 UPDATE 语句里带上：编辑/整理动过之后前端看得到新时间，整理的衰减也按它算
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                 onupdate=func.now())
 
 
 class MemorySetting(Base):
@@ -80,18 +82,22 @@ class MemorySetting(Base):
 
     __tablename__ = "memory_setting"
 
-    user_id: Mapped[str] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(32), ForeignKey("user.id", ondelete="CASCADE"),
+                                         primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     last_organized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                 onupdate=func.now())
 
 
 class MemoryWorkspaceSetting(Base):
     """空间级开关（企业合规口，设计 §1）：默认启用；空间管理员停用后，本空间的注入、提取、
-    记住工具全停，个人数据保留、随时恢复。全局表（判空间管理员经 AccessService，不进 RLS）。"""
+    记住工具全停，个人数据保留、随时恢复。全局表（判空间管理员经 AccessService，不进 RLS）。
+    空间关闭后残留行无害（只有一个布尔，无个人数据），不随空间级联清理。"""
 
     __tablename__ = "memory_workspace_setting"
 
     workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     disabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                 onupdate=func.now())

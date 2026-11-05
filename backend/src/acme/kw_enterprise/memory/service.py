@@ -12,7 +12,7 @@ from typing import Any
 
 from knowwork_server.access.rls import set_workspace
 from knowwork_server.jobs.queue import enqueue
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from .jobs import ORGANIZE
@@ -109,7 +109,8 @@ class MemoryService:
                          source=BY_USER, status=ACTIVE,
                          expires_at=_now() + timedelta(days=TASK_TTL_DAYS) if type == TASK else None)
             session.add(row)
-        return _view(row)
+            view = _view(row)   # 事务块内取视图：不依赖 sessionmaker 的 expire_on_commit 配置
+        return view
 
     async def edit(self, user_id: str, memory_id: str, *, content: str | None = None,
                    type: str | None = None, expires_at: datetime | None = None,
@@ -124,11 +125,14 @@ class MemoryService:
                 row.type = type
                 if type == TASK and row.expires_at is None:
                     row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
+                if type != TASK:
+                    row.expires_at = None  # 期限只在办事项有：改走别的类型就摘掉，别让整理误归档
             if clear_expires:
                 row.expires_at = None
             elif expires_at is not None:
                 row.expires_at = expires_at
-        return _view(row)
+            view = _view(row)
+        return view
 
     async def delete(self, user_id: str, memory_id: str) -> None:
         async with self._sessionmaker() as session, session.begin():
@@ -144,7 +148,8 @@ class MemoryService:
                 raise Conflict("只有待确认的记忆可以确认")
             await _require_capacity(session, user_id)
             row.status = ACTIVE
-        return _view(row)
+            view = _view(row)
+        return view
 
     async def dismiss(self, user_id: str, memory_id: str) -> None:
         """待确认忽略 = 物理删除。"""
@@ -163,13 +168,23 @@ class MemoryService:
             await _require_capacity(session, user_id)
             row.status = ACTIVE
             row.superseded_by = None
-        return _view(row)
+            view = _view(row)
+        return view
 
     # ---- 整理（M1 只入队；handler 在 M3 注册） ----
 
     async def organize(self, user_id: str, workspace_id: str) -> str:
         """排一条整理任务，返回任务 id。workspace_id 只为任务里的模型路由（按空间查模型目录）；
-        数据不按空间筛。同一空间同一人排队中的任务会合并，连点无副作用。"""
+        数据不按空间筛。同一空间同一人排队中的任务会合并，连点无副作用。
+
+        入队前过三道闸：本人得是这个空间的成员（写它的 job 表）、个人开关开着、空间开关开着——
+        判权在服务层（workspace:use 即成员，owner/admin/editor 都含），判不了宁可 403。"""
+        if self._access is None or not await self._access.check(user_id, workspace_id, "workspace", "use"):
+            raise Denied("只有本空间成员可以整理自己的记忆")
+        if not (await self.setting(user_id))["enabled"]:
+            raise Conflict("个人记忆已关闭，先在设置里打开再整理")
+        if (await self._workspace_disabled(workspace_id))["disabled"]:
+            raise Conflict("本空间已停用记忆，整理暂不执行")
         async with self._sessionmaker() as session, session.begin():
             await set_workspace(session, workspace_id)  # job 表在 RLS 名单里
             job_id = await enqueue(session, ORGANIZE, workspace_id=workspace_id, subject_id=user_id,
@@ -193,7 +208,15 @@ class MemoryService:
                 row.enabled = enabled
         return {"enabled": enabled}
 
-    async def workspace_setting(self, workspace_id: str) -> dict[str, Any]:
+    async def workspace_setting(self, actor_id: str, workspace_id: str) -> dict[str, Any]:
+        """空间开关的读取：成员可读（页面提示「本空间已停用」用），非成员 403——
+        不给外人探测任意空间开关状态的口子。"""
+        if self._access is None or not await self._access.check(actor_id, workspace_id, "workspace", "use"):
+            raise Denied("只有本空间成员可以查看本空间的记忆开关")
+        return await self._workspace_disabled(workspace_id)
+
+    async def _workspace_disabled(self, workspace_id: str) -> dict[str, Any]:
+        """开关的原始读取（不判权）：内部链路（organize 的闸、M2 的提供者）复用。"""
         async with self._sessionmaker() as session:
             row = await session.get(MemoryWorkspaceSetting, workspace_id)
         return {"disabled": row.disabled if row is not None else False}
@@ -245,7 +268,10 @@ async def _owned(session, user_id: str, memory_id: str) -> Memory:
 
 
 async def _require_capacity(session, user_id: str) -> None:
-    """生效满额判定：与写入同一个事务，两处并发确认不会把 active 顶过上限（设计 §8）。"""
+    """生效满额判定：先拿这个用户的 advisory 事务锁再 count——普通 SELECT count 不加锁，
+    READ COMMITTED 下两个并发事务能各自数到 199 再各插一条，把 active 顶过 200；
+    锁把同一用户的「查+写」串行化，事务结束自动释放（设计 §8 的承诺靠它兑现）。"""
+    await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:uid))"), {"uid": user_id})
     active = await session.scalar(select(func.count()).select_from(Memory)
                                   .where(Memory.user_id == user_id, Memory.status == ACTIVE))
     if int(active or 0) >= ACTIVE_CAP:

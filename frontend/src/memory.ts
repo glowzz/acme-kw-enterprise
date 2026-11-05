@@ -73,9 +73,20 @@ function parseCounts(value: unknown): MemoryCounts {
   };
 }
 
-export async function listMemories(status: MemoryStatus): Promise<readonly MemoryItem[]> {
-  const body = await request<unknown>(`/api/memory?status=${encodeURIComponent(status)}&limit=200`);
-  return listOf(isRecord(body) ? body.items : undefined, parseMemory);
+export interface MemoryPage {
+  readonly items: readonly MemoryItem[];
+  readonly total: number;
+}
+
+export async function listMemories(status: MemoryStatus, limit = 50, offset = 0): Promise<MemoryPage> {
+  const body = await request<unknown>(
+    `/api/memory?status=${encodeURIComponent(status)}&limit=${limit}&offset=${offset}`,
+  );
+  if (!isRecord(body)) return { items: [], total: 0 };
+  return {
+    items: listOf(body.items, parseMemory),
+    total: typeof body.total === 'number' && Number.isFinite(body.total) ? body.total : 0,
+  };
 }
 
 export async function memoryCounts(): Promise<MemoryCounts> {
@@ -86,7 +97,10 @@ export async function addMemory(type: MemoryType, content: string): Promise<void
   await request('/api/memory', { method: 'POST', body: { type, content } });
 }
 
-export async function editMemory(id: string, changes: { content?: string; type?: MemoryType }): Promise<void> {
+export async function editMemory(
+  id: string,
+  changes: { content?: string; type?: MemoryType; expiresAt?: string },
+): Promise<void> {
   await request(`/api/memory/${seg(id)}`, { method: 'PATCH', body: changes });
 }
 

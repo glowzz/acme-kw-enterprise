@@ -64,6 +64,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("memory_workspace_setting")
     op.drop_table("memory_setting")
-    op.drop_index("ix_memory_user_status", table_name="memory")
-    op.drop_index("ix_memory_user_id", table_name="memory")
-    op.drop_table("memory")
+    op.drop_table("memory")  # 表上的两条索引随表一起删，不必先 drop_index

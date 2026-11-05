@@ -13,6 +13,7 @@ from knowwork_server.audit.context import annotate
 from knowwork_server.auth.principal import Principal
 from pydantic import BaseModel, ConfigDict, Field
 
+from .models import CONTENT_MAX
 from .service import Conflict, Denied, Invalid, MemoryError, MemoryService, NotFound
 
 MemoryType = Literal["preference", "focus", "fact", "task"]
@@ -37,13 +38,13 @@ class AddBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: MemoryType
-    content: str = Field(min_length=1, max_length=500)
+    content: str = Field(min_length=1, max_length=CONTENT_MAX)
 
 
 class EditBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    content: str | None = Field(default=None, min_length=1, max_length=500)
+    content: str | None = Field(default=None, min_length=1, max_length=CONTENT_MAX)
     type: MemoryType | None = None
     expiresAt: datetime | None = None
     clearExpires: bool = False
@@ -58,7 +59,7 @@ class SettingBody(BaseModel):
 class OrganizeBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    workspaceId: str = Field(min_length=1, max_length=64)
+    workspaceId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.\-]{1,64}$")
 
 
 class WorkspaceSettingBody(BaseModel):
@@ -67,7 +68,7 @@ class WorkspaceSettingBody(BaseModel):
     disabled: bool
 
 
-def build_router(ctx) -> APIRouter:
+def build_routers(ctx) -> list[APIRouter]:
     service = MemoryService(ctx.global_sessionmaker, ctx.access)
     router = APIRouter(prefix="/api/memory", tags=["记忆"])
     workspace_router = APIRouter(prefix="/api/workspaces/{workspace_id}", tags=["记忆"])
@@ -94,7 +95,7 @@ def build_router(ctx) -> APIRouter:
         """手动添加一条记忆，直接生效"""
         return await _call(service.add(who.user_id, type=body.type, content=body.content))
 
-    @router.post("/organize")
+    @router.post("/organize", status_code=202)
     async def organize(body: OrganizeBody, who: Who) -> dict:
         """立即整理：合并说法重复的、很久没提的降权、到期归档；每天也会自动整理一次（M3 接上）"""
         job_id = await _call(service.organize(who.user_id, body.workspaceId))
@@ -153,11 +154,11 @@ def build_router(ctx) -> APIRouter:
         """已归档 / 已被更新 → 生效中"""
         return await _call(service.restore(who.user_id, memory_id))
 
-    # 空间开关（空间管理员）：路径落在 workspace 前缀下，与开源的空间路由同族
+    # 空间开关（成员可读、管理员改）：路径落在 workspace 前缀下，与开源的空间路由同族
     @workspace_router.get("/memory-setting")
     async def get_workspace_setting(workspace_id: WorkspacePath, who: Who) -> dict:
-        """本空间的记忆开关（没有记录 = 启用；任何成员可读，页面提示用）"""
-        return await _call(service.workspace_setting(workspace_id))
+        """本空间的记忆开关（没有记录 = 启用；成员可读，页面提示用）"""
+        return await _call(service.workspace_setting(who.user_id, workspace_id))
 
     @workspace_router.put("/memory-setting")
     async def put_workspace_setting(workspace_id: WorkspacePath, body: WorkspaceSettingBody,
@@ -168,5 +169,6 @@ def build_router(ctx) -> APIRouter:
                  resource_id=workspace_id, disabled=body.disabled)
         return result
 
-    router.include_router(workspace_router)
-    return router
+    # 空间开关路由有独立前缀，不能 include 进带 prefix 的 router（会被组合成
+    # /api/memory/api/workspaces/...）：作为兄弟路由一起返回，setup_api 本来就收列表
+    return [router, workspace_router]
