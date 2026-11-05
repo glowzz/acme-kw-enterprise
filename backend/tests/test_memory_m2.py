@@ -492,3 +492,62 @@ async def test_provider_degrades_real_embed_failure(sessionmaker):
     boom = MemoryContext(service, _Boom([], embed_dim=4), None)
     turn = await boom.provider(_Request())
     assert turn.standing != "" and turn.turn == ""  # 自己降级：standing 保底、turn 放弃
+
+
+# ---- R3 确认轮：R2 新增三条判定分支的回归 ----
+
+
+async def test_judge_noop_drops_duplicate(sessionmaker):
+    """noop 判定＝丢弃候选：同义重复不许以高置信落 ACTIVE（R3 之前判重闭环被打穿）。"""
+    service = MemoryService(sessionmaker, FakeAccess())
+    await _seed(sessionmaker, "u1", status=ACTIVE, content="回答用表格", embedding=[6.0, 0.0, 0.0, 0.0])
+    import json
+    models = FakeModels([
+        json.dumps({"memories": [
+            {"type": PREFERENCE, "content": "回答用表格呈现 aaaaa", "quote": "原话", "confidence": 0.9}]}),
+        json.dumps({"decisions": [{"index": 0, "target": "占位", "action": "noop",
+                                   "content": "回答用表格呈现 aaaaa"}]}),
+    ])
+    counts = await extract_from_turn(service, models, "u1", "ws1",
+                                     "回答用表格 aaaaa" + "，保持" * 5, "好的" + "，明白" * 5)
+    assert counts == {"active": 0, "pending": 0, "updated": 0, "replaced": 0, "dropped": 1}
+
+
+async def test_conflict_clamped_candidate_rejects_update(sessionmaker):
+    """矛盾候选只禁 update：判定给 update 也打回 insert——极性不许被原地改写翻转。"""
+    service = MemoryService(sessionmaker, FakeAccess())
+    old_id = await _seed(sessionmaker, "u1", status=ACTIVE, content="回答用表格输出",
+                         embedding=[6.0, 0.0, 0.0, 0.0])
+    import json
+    models = FakeModels([
+        json.dumps({"memories": [
+            {"type": PREFERENCE, "content": "回答不用表格输出 aaaaa", "quote": "原话", "confidence": 0.9}]}),
+        json.dumps({"decisions": [{"index": 0, "target": old_id, "action": "update",
+                                   "content": "回答用表格输出"}]}),  # 判定居然说改写成肯定句：必须被拦下
+    ])
+    counts = await extract_from_turn(service, models, "u1", "ws1",
+                                     "以后不要用表格输出 aaaaa" + "，改掉" * 5, "明白" + "，改" * 5)
+    assert counts["updated"] == 0 and counts["pending"] == 1  # 候选落待确认，旧行原样
+    async with sessionmaker() as session:
+        row = await session.get(Memory, old_id)
+        assert row is not None and row.content == "回答用表格输出" and row.status == ACTIVE
+
+
+async def test_diluted_rewrite_reverts_to_pending(sessionmaker):
+    """防稀释复核：旧句带否定、改写丢了否定（「不用表格」→「用表格」）→ 撤销改写转待确认。"""
+    service = MemoryService(sessionmaker, FakeAccess())
+    old_id = await _seed(sessionmaker, "u1", status=ACTIVE, content="回答不用表格输出",
+                         embedding=[6.0, 0.0, 0.0, 0.0])
+    import json
+    models = FakeModels([
+        json.dumps({"memories": [
+            {"type": PREFERENCE, "content": "回答不用表格输出 aaaaa", "quote": "原话", "confidence": 0.9}]}),
+        json.dumps({"decisions": [{"index": 0, "target": old_id, "action": "update",
+                                   "content": "回答用表格输出"}]}),  # 丢了「不」：稀释改写
+    ])
+    counts = await extract_from_turn(service, models, "u1", "ws1",
+                                     "回答不用表格输出 aaaaa" + "，保持" * 5, "好的" + "，明白" * 5)
+    assert counts["updated"] == 0 and counts["pending"] == 1
+    async with sessionmaker() as session:
+        row = await session.get(Memory, old_id)
+        assert row is not None and row.content == "回答不用表格输出"  # 原句保留
