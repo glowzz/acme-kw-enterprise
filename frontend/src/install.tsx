@@ -6,6 +6,7 @@
 import type { RouteObject } from 'react-router';
 import { BookOpen } from '@openai/apps-sdk-ui/components/Icon';
 import type { Register } from '@knowwork/web/slots/registry';
+import { MemoryTab } from './pages/memory';
 import { WorkspacesPage } from './pages/workspaces';
 import { SkillsEnterprisePanel } from './panels/skills-enterprise';
 import { ToolsEnterprisePanel } from './panels/tools-enterprise';
@@ -19,4 +20,6 @@ export function install(register: Register): void {
   register('admin.skills.enterprise', { children: <SkillsEnterprisePanel /> });
   // 「工具与 MCP → 企业」页签：同上
   register('admin.tools.enterprise', { children: <ToolsEnterprisePanel /> });
+  // 个人设置 → 我的记忆：对话里「管理记忆」的深链是 /settings?tab=memory（chat.tools 的 notice 用）
+  register('settings.tabs', { key: 'memory', label: '我的记忆', children: <MemoryTab /> });
 }

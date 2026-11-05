@@ -22,9 +22,9 @@ def test_license_and_extension_discovered() -> None:
 def test_contract_attributes() -> None:
     extension = installed_extensions().active[0]
     assert extension.license_module == "enterprise"
-    assert extension.model_modules == (), "一期不建表"
-    assert extension.rls_tables == ()
-    assert extension.migrations is None, "无迁移分支：三个功能的存储都在开源服务里"
+    assert extension.model_modules == ("acme.kw_enterprise.memory.models",), "M1 起：记忆的三张全局表"
+    assert extension.rls_tables == (), "记忆跟着人走、跨空间，不进 RLS"
+    assert extension.migrations is not None and extension.migrations.is_dir(), "记忆走自己的迁移分支"
 
 
 def _build_app() -> FastAPI:
@@ -43,6 +43,7 @@ def _build_app() -> FastAPI:
     ctx.platform_skills = None  # type: ignore[attr-defined]
     ctx.enterprise_mcp = None  # type: ignore[attr-defined]
     ctx.access = None  # type: ignore[attr-defined]
+    ctx.global_sessionmaker = None  # type: ignore[attr-defined]  记忆路由装配只存引用，请求时才用
 
     app = FastAPI()
     for router in extension.setup_api(ctx):
@@ -101,3 +102,20 @@ def test_enterprise_mcp_routes() -> None:
     assert "/api/enterprise-mcp/promote" in paths
     assert "/api/enterprise-mcp/{server_id}/tools/{tool_name}" in paths
     assert ("PUT", "/api/enterprise-mcp/{server_id}/audience") in routes
+
+
+def test_memory_routes() -> None:
+    """记忆层 M1 的全部路由：列表/统计/添加/整理/开关/导出/清空/单条操作 + 空间开关。"""
+    routes = _routes(_build_app())
+    memory_paths = {path for _, path in routes if path.startswith("/api/memory")}
+    assert memory_paths >= {
+        "/api/memory", "/api/memory/counts", "/api/memory/organize", "/api/memory/settings",
+        "/api/memory/export", "/api/memory/clear",
+        "/api/memory/{memory_id}", "/api/memory/{memory_id}/confirm",
+        "/api/memory/{memory_id}/dismiss", "/api/memory/{memory_id}/restore",
+    }
+    assert ("POST", "/api/memory/organize") in routes
+    assert ("POST", "/api/memory/clear") in routes
+    assert ("PATCH", "/api/memory/{memory_id}") in routes
+    assert ("GET", "/api/workspaces/{workspace_id}/memory-setting") in routes
+    assert ("PUT", "/api/workspaces/{workspace_id}/memory-setting") in routes

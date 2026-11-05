@@ -1,0 +1,18 @@
+"""记忆层的任务类型：api（入队）与 worker（执行）共用的唯一定义，两边不会各配一套
+（照 jobs/kinds.py 的纪律）。自带 memory 池，不挤默认 core 池——重下游自带池是仓库的既有纪律。
+
+M1 只有入队（整理按钮）：handler 在 M3 注册，在那之前排下的任务静静排队（任务面板可见）。
+M2 注册 memory.extract 的 handler 时沿用这里的定义，不再改口径。
+"""
+
+from knowwork_server.jobs import JobKind
+from knowwork_server.jobs.kinds import SERVICE_DELAYS
+
+# 整理：合并说法重复的、很久没提的降权、到期归档、腾位、补向量（设计 §7）。subject=user_id，一天至多一条
+ORGANIZE = JobKind("memory.organize", pool="memory", max_tries=3, lease_seconds=120.0, timeout_seconds=600.0,
+                   retry_delays=SERVICE_DELAYS, version=1, cancelable=True, label="记忆整理")
+
+# 提取（M2）：回合结束入队，worker 里用结构化输出抽取候选再判重。subject=conversation_id，
+# 同一会话连续几轮合并成一条、载荷换最新
+EXTRACT = JobKind("memory.extract", pool="memory", max_tries=3, lease_seconds=120.0, timeout_seconds=300.0,
+                  retry_delays=SERVICE_DELAYS, version=1, cancelable=True, label="记忆提取")
