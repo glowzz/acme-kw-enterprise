@@ -176,7 +176,7 @@ async def test_restore_refreshes_expired_task(sessionmaker, service):
     assert restored["expiresAt"] is not None and restored["expiresAt"] > datetime.now(UTC)
 
 
-async def test_restore_superseded_archives_successor(sessionmaker, service):
+async def test_restore_superseded_supersedes_successor(sessionmaker, service):
     """恢复「已被更新」的旧版本时，取代它的那条降为 SUPERSEDED 并指回本行：新旧互斥，不同时注入。
     （后继落 SUPERSEDED 而非 ARCHIVED：语义是「被旧版取代」，页签角标也按这个口径，R5 定。）"""
     new_id = await _insert(sessionmaker, "u1", status=ACTIVE)
@@ -385,6 +385,22 @@ async def test_restore_superseded_is_capacity_neutral(sessionmaker, service):
                         for index in range(ACTIVE_CAP - 1))
     restored = await service.restore("u1", superseded)  # 后继先降级腾出一席，恢复不该撞满额
     assert restored["status"] == ACTIVE
+
+
+async def test_restore_walks_multi_hop_chain(sessionmaker, service):
+    """多跳链 A SUP→B SUP→C ACT：恢复 A 整条收敛到恰好一条 ACTIVE，且链仍可导航。
+    （R6：next_pointer 护栏此前零覆盖——只有这个形状才让续链真正起作用。）"""
+    c = await _insert(sessionmaker, "u1", status=ACTIVE, content="C")
+    b = await _insert(sessionmaker, "u1", status=SUPERSEDED, content="B", superseded_by=c)
+    a = await _insert(sessionmaker, "u1", status=SUPERSEDED, content="A", superseded_by=b)
+    restored = await service.restore("u1", a)
+    assert restored["status"] == ACTIVE
+    statuses = {item["id"]: item["status"] for item in await service.export("u1")}
+    assert statuses[a] == ACTIVE and statuses[b] == SUPERSEDED and statuses[c] == SUPERSEDED
+    # 链仍可导航：恢复 C，A 要让位
+    assert (await service.restore("u1", c))["status"] == ACTIVE
+    statuses = {item["id"]: item["status"] for item in await service.export("u1")}
+    assert statuses[c] == ACTIVE and statuses[a] == SUPERSEDED
 
 
 async def test_restore_round_trip_stays_exclusive(sessionmaker, service):

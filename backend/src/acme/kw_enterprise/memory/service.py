@@ -169,20 +169,22 @@ class MemoryService:
     async def restore(self, user_id: str, memory_id: str) -> dict[str, Any]:
         """已归档 / 已被更新 → 生效中；满额 409（提示先删几条）。
 
-        连带语义（R3-R5 审查逐步补齐）：
+        连带语义（R3-R6 审查逐步补齐）：
         - 恢复是否认它的全部后继：沿取代链（superseded_by 正向）把仍然生效的后继降为
-          SUPERSEDED 并把指针指回本行。**指针回写是往返互斥的关键**——后继将来恢复时靠它
-          找到本行，没有它，恢复后继会把矛盾的一对同时复活；顺链遍历盖住链式情形
-          （后继自身又被更新的那种）。
-        - 本行是唯一的多行读-改-写路径：与满额判定共用同一把 advisory 事务锁，两个并发恢复
-          不会把同一个后继各自降级、互相覆盖指针（那会永久断链）。
+          SUPERSEDED 并把指针指回本行。**指针回写是往返互斥的关键**——后继将来恢复时靠
+          它找到本行，没有它，恢复后继会把矛盾的一对同时复活；顺链遍历保证多跳链
+          （后继自身又被更新的那种）整条收敛。先存原指针再覆写是防御护栏：当前不变式下
+          生效行的指针恒空，两种写法等价，但链上语义不应依赖这个巧合。
+        - 整个恢复（本行状态闸、链种子、后继 RMW、写入）都在同一把 advisory 事务锁内：
+          并发的两个恢复不会把同一个后继各自降级、互相覆盖指针（那会永久断链）；
+          M3 起 organize 也会写 status/superseded_by，锁外读会看到脏形状（R6 收窄）。
         - 链处理是容量中性的（降级若干、激活一条），所以先做互斥再查容量，不会误报满额；
         - 过期归档的在办事项恢复 = 再给一个默认期限窗口，不然一恢复下一次整理又把它归档。"""
         async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)  # 锁盖全程：状态闸、链种子、后继 RMW、写入
             row = await _owned(session, user_id, memory_id)
             if row.status not in (ARCHIVED, SUPERSEDED):
                 raise Conflict("只有已归档或已被更新的记忆可以恢复")
-            await _acquire_capacity_lock(session, user_id)  # 后继的读-改-写也要在锁内（R5）
             chain = [row.superseded_by] if row.superseded_by else []
             seen: set[str] = set()
             while chain:
@@ -193,9 +195,9 @@ class MemoryService:
                 successor = await session.get(Memory, successor_id)
                 if successor is None or successor.user_id != user_id:
                     continue
-                next_pointer = successor.superseded_by  # 先取原指针再覆写，续链不断（R5）
+                next_pointer = successor.superseded_by  # 先取原指针再覆写（R5 的防御护栏，见 docstring）
                 if successor.status == ACTIVE:
-                    successor.status = SUPERSEDED  # 语义是「被本行取代」，不是归档（贴合 §3 与页签角标）
+                    successor.status = SUPERSEDED  # 被「恢复的旧版」取代——§3 的恢复转移（R6 补进设计表）
                     successor.superseded_by = row.id
                 if next_pointer and next_pointer != row.id:
                     chain.append(next_pointer)
@@ -306,8 +308,8 @@ async def _owned(session, user_id: str, memory_id: str) -> Memory:
 
 
 async def _acquire_capacity_lock(session, user_id: str) -> None:
-    """同一用户的 advisory 事务锁：恢复的跨行读-改-写与满额「查+写」共用一把，
-    同一用户的并发操作在此串行化，事务结束自动释放（对同会话同 key 可重入）。"""
+    """同一用户的 advisory 事务锁：恢复的全程（状态闸/链遍历/写入）与满额「查+写」共用一把，
+    同一用户的并发操作在此串行化，事务结束自动释放（对同会话同 key 可重入，重复取锁不阻塞）。"""
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:uid))"), {"uid": user_id})
 
 

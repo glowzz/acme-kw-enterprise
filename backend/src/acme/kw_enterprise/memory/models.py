@@ -71,7 +71,7 @@ class Memory(Base):
     # 会让 last_mentioned_at 永远是今天，衰减永不触发（设计 §4）
     mention_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_mentioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # 在办事项到期归档；被哪条新记忆取代（不设 FK：简化恢复语义）
+    # 在办事项到期归档；被哪条记忆取代（中性对手指针：提取链指向新版本，恢复链回指旧版本；不设 FK）
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     superseded_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
