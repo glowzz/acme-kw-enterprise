@@ -152,13 +152,20 @@ class MemoryService:
     # ---- 状态机（设计 §3） ----
 
     async def confirm(self, user_id: str, memory_id: str) -> dict[str, Any]:
-        """待确认 → 生效中；满额 409。"""
+        """待确认 → 生效中；满额 409。带对手指针的候选（replace 但当时没生效的，R2 前的
+        H3 口径）确认时把对手降为 SUPERSEDED 指回本行——新旧互斥在这里闭环。"""
         async with self._sessionmaker() as session, session.begin():
             row = await _owned(session, user_id, memory_id)
             if row.status != PENDING:
                 raise Conflict("只有待确认的记忆可以确认")
             await _require_capacity(session, user_id)
+            if row.superseded_by:
+                rival = await session.get(Memory, row.superseded_by)
+                if rival is not None and rival.user_id == user_id and rival.status == ACTIVE:
+                    rival.status = SUPERSEDED
+                    rival.superseded_by = row.id
             row.status = ACTIVE
+            row.superseded_by = None
             view = _view(row)
         return view
 
@@ -246,6 +253,16 @@ class MemoryService:
         value = (await self.setting(user_id))["lastOrganizedAt"]
         return value.date().isoformat() if value is not None else None
 
+    async def mark_organized(self, user_id: str) -> None:
+        """写「整理过」标记：提供者顺手入队成功后写（M3 的整理 handler 完成时也写它）。
+        upsert 不动 enabled——标记只管记账。"""
+        async with self._sessionmaker() as session, session.begin():
+            statement = pg_insert(MemorySetting).values(user_id=user_id, enabled=True,
+                                                        last_organized_at=_now())
+            await session.execute(statement.on_conflict_do_update(
+                index_elements=[MemorySetting.user_id],
+                set_={"last_organized_at": statement.excluded.last_organized_at}))
+
     async def set_setting(self, user_id: str, enabled: bool) -> dict[str, Any]:
         """关闭只停链路（注入给空、提取停、工具不给），数据保留——重新打开接着用（设计 §1）。
         upsert 写法：两个并发的「首次保存」都查不到行时，普通的 get+insert 会撞主键 500。"""
@@ -299,13 +316,14 @@ class MemoryService:
                      "expiresAt": row.expires_at} for row in rows]
 
     async def dedup_pool(self, user_id: str) -> list[dict[str, Any]]:
-        """判重的比对池：生效中 + 待确认的记忆（id/内容/向量）。提取落库前对它算签名、
-        否定极性与余弦；归档与已被更新的不参与（它们不会再注入）。"""
+        """判重的比对池：生效中 + 待确认的记忆（id/内容/来源/向量）。提取落库前对它算签名、
+        否定极性与余弦；归档与已被更新的不参与（它们不会再注入）。source 给判定清单标注
+        「手动添加不可改写」（人工优先，§7）。"""
         async with self._sessionmaker() as session:
             rows = await session.scalars(select(Memory).where(
                 Memory.user_id == user_id, Memory.status.in_((ACTIVE, PENDING))))
             return [{"id": row.id, "content": row.content, "status": row.status,
-                     "embedding": row.embedding} for row in rows]
+                     "source": row.source, "embedding": row.embedding} for row in rows]
 
     async def track_mentions(self, user_id: str, memory_ids: Sequence[str]) -> None:
         """记账只记 turn 段命中的条目（standing 常驻不算提及——按「在场」记账会让衰减永不触发，
@@ -335,45 +353,52 @@ class MemoryService:
 
         每行：{type, content, quote, confidence, embedding, embedding_model,
                action: "insert"|"update"|"replace", target: 目标记忆 id}。
-        - update：改写目标记忆的内容（id 不变、记账 +1、向量按候选的换）；
-        - replace：目标降为 superseded（指向新行）、新行入库；
-        - insert：置信 ≥0.8 且有 quote 直接生效，否则待确认；满额不报错——降为待确认
-          （M2 无腾位，M3 的整理腾出位置后用户可手动确认）。
+        - update/replace 的目标必须是本人 ACTIVE 且 source=extracted 的行（人工优先，设计 §7：
+          手动添加与「记住」写入的不被系统改写/取代）；目标不可写时退化为普通入库（不丢候选）；
+        - replace 只有在新行确定生效时才降旧行——置信被钳、无出处、满额都会让新行落待确认，
+          旧 ACTIVE 保持原状，互斥留给 confirm（pending 行暂存对手指针，确认时降对手）；
+        - insert/replace：置信 ≥0.8 且有 quote 直接生效，否则待确认；score 记提取置信度（§2）；
+        - 满额不报错——降为待确认（M2 无腾位，M3 整理腾位后可手动确认）。
         返回 {active, pending, updated, replaced, dropped} 给 facts 与日志。"""
         now = _now()
         counts = {"active": 0, "pending": 0, "updated": 0, "replaced": 0, "dropped": 0}
         async with self._sessionmaker() as session, session.begin():
             await _acquire_capacity_lock(session, user_id)
             for item in rows:
-                content = _content_of(item["content"])
+                raw_content = item["content"].strip()
+                if not 1 <= len(raw_content) <= CONTENT_MAX:
+                    counts["dropped"] += 1   # 超长陈述不是好记忆：丢弃本行，不炸整批（R2 前的教训）
+                    continue
+                confidence = min(max(float(item.get("confidence", 0.0)), 0.0), 1.0)
                 action, target = item.get("action", "insert"), item.get("target")
-                base = {"type": item["type"], "content": content, "quote": item.get("quote", ""),
+                base = {"type": item["type"], "content": raw_content, "quote": item.get("quote", ""),
                         "origin_workspace_id": workspace_id, "embedding": item.get("embedding"),
                         "embedding_model": item.get("embedding_model")}
-                if action == "update" and target:
-                    row = await session.get(Memory, target)
-                    if row is None or row.user_id != user_id or row.status != ACTIVE:
-                        counts["dropped"] += 1
-                        continue
-                    row.content = content
+                target_row = None
+                if target:
+                    candidate_target = await session.get(Memory, target)
+                    if (candidate_target is not None and candidate_target.user_id == user_id
+                            and candidate_target.status == ACTIVE
+                            and candidate_target.source == EXTRACTED):
+                        target_row = candidate_target
+                if action == "update" and target_row is not None:
+                    row = target_row
+                    row.content = base["content"]
                     row.quote = base["quote"] or row.quote
                     row.type = base["type"]
                     row.embedding = base["embedding"]      # 改写后的内容配候选的向量
                     row.embedding_model = base["embedding_model"]
-                    if base["type"] == TASK:
+                    row.score = max(row.score, confidence)
+                    if base["type"] == TASK:               # 期限归属跟最终类型走（与 edit 同不变式）
                         row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
+                    else:
+                        row.expires_at = None
                     row.mention_count += 1
                     row.last_mentioned_at = now
                     counts["updated"] += 1
                     continue
                 new_id = f"mem_{uuid.uuid4().hex}"
-                if action == "replace" and target:
-                    old = await session.get(Memory, target)
-                    if old is not None and old.user_id == user_id and old.status == ACTIVE:
-                        old.status = SUPERSEDED
-                        old.superseded_by = new_id
-                        counts["replaced"] += 1
-                confident = item.get("confidence", 0.0) >= ACTIVE_CONFIDENCE and bool(base["quote"])
+                confident = confidence >= ACTIVE_CONFIDENCE and bool(base["quote"])
                 status = ACTIVE if confident else PENDING
                 if status == ACTIVE:
                     active_count = await session.scalar(select(func.count()).select_from(Memory)
@@ -381,10 +406,17 @@ class MemoryService:
                                                                Memory.status == ACTIVE))
                     if int(active_count or 0) >= ACTIVE_CAP:
                         status = PENDING  # M2 无腾位：满额先进待确认，M3 整理腾位后可手动确认
+                # replace 只在真生效时降旧行；没生效就暂存对手指针，confirm 时再降（不凭空消失）
+                superseded_by = target_row.id if (action == "replace" and target_row is not None
+                                                  and status == PENDING) else None
+                if action == "replace" and target_row is not None and status == ACTIVE:
+                    target_row.status = SUPERSEDED
+                    target_row.superseded_by = new_id
+                    counts["replaced"] += 1
                 session.add(Memory(
-                    id=new_id, user_id=user_id, status=status, source=EXTRACTED,
+                    id=new_id, user_id=user_id, status=status, source=EXTRACTED, score=confidence,
                     expires_at=_now() + timedelta(days=TASK_TTL_DAYS) if base["type"] == TASK else None,
-                    **base))
+                    superseded_by=superseded_by, **base))
                 counts["active" if status == ACTIVE else "pending"] += 1
         return counts
 

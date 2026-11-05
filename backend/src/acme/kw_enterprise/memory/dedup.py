@@ -20,9 +20,12 @@ def signature(content: str) -> str:
     return _WS.sub("", unicodedata.normalize("NFKC", content).casefold())
 
 
-# 否定词：中文单字与词、英文词（"no " 带尾随空格避免误配 noise/norm）
-NEGATION_TOKENS = ("不", "没", "别", "勿", "暂不", "not", "never", "no ", "don't", "won't",
-                   "isn't", "avoid", "无需", "不用")
+# 否定检测（M2 R1 审查定口径）：只认**明确的否定短语**，不做单字子串匹配——「不错」「不同」
+# 「差不多」「没关系」「特别」这类高频词全是裸单字误伤面。宁可漏（漏掉的冲突有 LLM 判定与
+# 待确认兜底），不把惯用肯定句误判成否定。
+NEGATION_PHRASES = ("不用", "不要", "不能", "不会", "不想", "不喜欢", "不希望", "不可以", "不使用",
+                    "不采用", "没有", "暂不", "避免", "别用", "别再", "别发",
+                    "don't", "won't", "isn't")
 
 # 停词：算「内容 token 重叠」时滤掉，不参与语义比对。注意不能把否定词放进来
 _STOP_CN = ("的 了 是 我 你 他 她 它 们 我们 你们 和 与 或 在 有 就 都 也 很 被 把 吧 呢 吗"
@@ -47,7 +50,12 @@ def content_tokens(text: str) -> frozenset[str]:
 
 def has_negation(text: str) -> bool:
     lowered = unicodedata.normalize("NFKC", text).casefold()
-    return any(token in lowered for token in NEGATION_TOKENS)
+    if any(phrase in lowered for phrase in NEGATION_PHRASES):
+        return True
+    return bool(set(_ASCII.findall(lowered)) & _NEG_EN)  # 英文按词级匹配（not/never/no/avoid）
+
+
+_NEG_EN = frozenset({"no", "not", "never", "avoid"})
 
 
 def negation_conflict(a: str, b: str) -> bool:

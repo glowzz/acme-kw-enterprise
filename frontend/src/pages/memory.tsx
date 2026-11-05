@@ -231,11 +231,13 @@ function MemoryList({
       key: 'content',
       title: '内容',
       ellipsis: true,
-      // 待确认的候选带原话出处（提取链路的证据链）：判断「确认/忽略」先看依据
+      // 待确认的候选带原话出处（提取链路的证据链）：判断「确认/忽略」先看依据；其他页签不占行
       render: (m) => (
         <div>
           <div>{m.content}</div>
-          {m.quote ? <div className="kw-secondary-text">原话：{m.quote}</div> : null}
+          {status === 'pending' && m.quote ? (
+            <div className="kw-secondary-text">原话：{m.quote}</div>
+          ) : null}
         </div>
       ),
     },

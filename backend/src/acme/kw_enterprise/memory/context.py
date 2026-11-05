@@ -13,7 +13,7 @@ from typing import Any
 
 from knowwork_server.conversations.turn_context import TurnContextRequest
 from knowwork_server.kernel.contract import TurnContext
-from knowwork_server.models.client import ModelCallError, ModelClient
+from knowwork_server.models.client import ModelClient
 from knowwork_server.models.schemas import Capability
 
 from .dedup import cosine
@@ -106,7 +106,8 @@ class MemoryContext:
         turn_text, hit_ids = await self._turn_segment(request, memories)
         if hit_ids:
             self._spawn(self._service.track_mentions(request.user_id, hit_ids))
-        if datetime.now().date().isoformat() != setting["lastOrganizedAt"] and memories:
+        if memories and datetime.now().date().isoformat() != await self._service.last_organized_on(
+                request.user_id):
             self._spawn(self._organize_later(request))  # 每天第一次见这个人：顺手排一条整理
         return TurnContext(standing=standing, turn=turn_text)
 
@@ -134,16 +135,19 @@ class MemoryContext:
         try:
             [vector] = await self._models.embed(request.workspace_id, embed_alias, [request.text],
                                                 background=False)
-        except ModelCallError:
+        except Exception:  # 宽吞：embed 挂了/返回形状不对都不该连累 standing（§4 保底口径）
             log.warning("memory recall embed failed for %s", request.conversation_id, exc_info=True)
             return "", []
         scored = sorted(((cosine(vector, row["embedding"]), row) for row in with_vectors),
                         key=lambda pair: -pair[0])
         in_standing = {row["content"] for row in standing_rows(memories)}
-        hits = [row for score, row in scored[:RECALL_TOP] if score >= RECALL_THRESHOLD
-                and row["content"] not in in_standing]
-        text = format_turn(hits)
-        return (text[:TURN_BUDGET], [row["id"] for row in hits]) if text else ("", [])
+        hits = [row for score, row in scored if score >= RECALL_THRESHOLD
+                and row["content"] not in in_standing][:RECALL_TOP]  # 先查重再取前 10：不被常驻条目挤掉
+        contents = [row["content"] for row in hits]
+        while contents and len(format_turn([{"content": c} for c in contents])) > TURN_BUDGET:
+            contents.pop()  # 整行丢弃与 standing 同口径，不截半句
+        text = format_turn([{"content": c} for c in contents]) if contents else ""
+        return (text, [row["id"] for row in hits if row["content"] in contents]) if text else ("", [])
 
     def _spawn(self, work) -> None:
         """记账与顺手整理：后台任务、吞异常，绝不拖慢也不影响本轮。"""
@@ -158,6 +162,9 @@ class MemoryContext:
 
     async def _organize_later(self, request: TurnContextRequest) -> None:
         await self._service.organize(request.user_id, request.workspace_id)
+        # 入队成功即写标记：否则 M3 的 handler 注册前 last_organized_at 永远是空，
+        # 「每天一次」退化成每轮一次事务（R2 前的 H1 修复的另一半）
+        await self._service.mark_organized(request.user_id)
 
 
 async def _resolve(models: ModelClient, workspace_id: str) -> str | None:

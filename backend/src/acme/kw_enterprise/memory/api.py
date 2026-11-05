@@ -104,8 +104,9 @@ def build_routers(ctx, service: MemoryService | None = None) -> list[APIRouter]:
 
     @router.get("/settings")
     async def get_settings(who: Who) -> dict:
-        """个人记忆开关（没有记录 = 开启）"""
-        return await _call(service.setting(who.user_id))
+        """个人记忆开关（没有记录 = 开启）。lastOrganizedAt 是内部记账，不出接口。"""
+        result = await _call(service.setting(who.user_id))
+        return {"enabled": result["enabled"]}
 
     @router.put("/settings")
     async def put_settings(body: SettingBody, who: Who) -> dict:

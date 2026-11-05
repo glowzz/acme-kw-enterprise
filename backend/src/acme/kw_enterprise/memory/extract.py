@@ -15,7 +15,7 @@ from knowwork_server.models.client import ModelCallError, ModelClient
 from knowwork_server.models.schemas import Capability
 
 from .dedup import cosine, negation_conflict, signature
-from .models import ACTIVE_CONFIDENCE, FACT, FOCUS, PREFERENCE, QUOTE_MAX, TASK
+from .models import ACTIVE_CONFIDENCE, CONTENT_MAX, FACT, FOCUS, PREFERENCE, QUOTE_MAX, TASK
 from .service import MemoryService
 
 log = logging.getLogger(__name__)
@@ -121,9 +121,8 @@ def _parse_candidates(raw: str) -> list[dict[str, Any]]:
             confidence = min(max(float(confidence), 0.0), 1.0)
         except (TypeError, ValueError):
             continue
-        candidates.append({"type": kind,
-                           # 双倍宽限：落库前 service 会按 CONTENT_MAX 再校
-                           "content": content.strip()[:CONTENT_MAX_CHARS * 2],
+        # content 原样带出：超长候选由规则前置按 CONTENT_MAX 丢弃（预截断会把垃圾变短混进来）
+        candidates.append({"type": kind, "content": content.strip(),
                            "quote": quote.strip()[:QUOTE_MAX] if isinstance(quote, str) else "",
                            "confidence": confidence})
     return candidates
@@ -131,14 +130,16 @@ def _parse_candidates(raw: str) -> list[dict[str, Any]]:
 
 def _similar_targets(candidate_content: str, embedding: list[float] | None,
                      pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """与既有记忆（active+pending、有向量）算余弦，取 ≥0.82 的前 3 条。"""
+    """与既有记忆（active+pending、有向量）算余弦，取 ≥0.82 的前 3 条。带 kind：
+    手动添加/工具写入的行在判定清单里标注「不可改写」，store_extract 再兜底一次（§7 人工优先）。"""
     if embedding is None:
         return []
     scored = []
     for row in pool:
         score = cosine(embedding, row["embedding"])
         if score >= SIMILAR_THRESHOLD:
-            scored.append({"id": row["id"], "content": row["content"], "score": score})
+            scored.append({"id": row["id"], "content": row["content"], "score": score,
+                           "kind": row.get("source", "extracted")})
     scored.sort(key=lambda item: -item["score"])
     return scored[:SIMILAR_TOP]
 
@@ -173,18 +174,24 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
     pool = await service.dedup_pool(user_id)
     signatures = {signature(row["content"]) for row in pool}
 
-    # 纯规则前置（不花 LLM）：签名重复丢弃；否定极性冲突强制待确认
+    # 纯规则前置（不花 LLM）：超长候选丢弃（一句陈述写不到 500 字，模型失守就不留）；签名重复
+    # （对池 + 同批互查）丢弃；否定极性冲突钳到待确认档
     kept: list[dict[str, Any]] = []
-    for index, candidate in enumerate(candidates):
+    pre_dropped = 0
+    for candidate in candidates:
+        if len(candidate["content"]) > CONTENT_MAX:
+            pre_dropped += 1
+            continue
         if signature(candidate["content"]) in signatures:
+            pre_dropped += 1
             continue
         conflict = any(negation_conflict(candidate["content"], row["content"]) for row in pool)
         if conflict:
             candidate["confidence"] = min(candidate["confidence"], ACTIVE_CONFIDENCE - 0.01)
-        candidate["_index"] = index
+        signatures.add(signature(candidate["content"]))
         kept.append(candidate)
     if not kept:
-        return {"active": 0, "pending": 0, "updated": 0, "replaced": 0, "dropped": 0}
+        return {"active": 0, "pending": 0, "updated": 0, "replaced": 0, "dropped": pre_dropped}
 
     embed_alias = await resolve_model(models, workspace_id, Capability.EMBEDDING, EMBED_MODEL_ENV)
     if embed_alias is None:
@@ -195,38 +202,64 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
                                          [candidate["content"] for candidate in kept],
                                          background=True)
         except ModelCallError as error:
-            raise _job_error(error) from error
-        for candidate, vector in zip(kept, vectors, strict=True):
-            candidate["embedding"] = vector
-            candidate["embedding_model"] = embed_alias
+            log.warning("memory extract: embed failed; candidates keep no vectors (%s)",
+                        error.code)  # 设计 §5：向量失败留空，不影响按置信落库
+        else:
+            if len(vectors) != len(kept):
+                log.warning("memory extract: embed returned %s vectors for %s candidates; skipping vectors",
+                            len(vectors), len(kept))
+            else:
+                for candidate, vector in zip(kept, vectors, strict=True):
+                    candidate["embedding"] = vector
+                    candidate["embedding_model"] = embed_alias
 
-    # 相似命中才进 LLM 判定（合并成一次调用，预算封顶）
+    # 相似命中才进 LLM 判定（合并成一次调用，预算封顶 2 次）
     for candidate in kept:
         candidate["similar"] = _similar_targets(candidate["content"], candidate.get("embedding"), pool)
     judged = [candidate for candidate in kept if candidate["similar"]]
     if judged and embed_alias is not None:
+        for slot, candidate in enumerate(judged):   # 槽位号按清单重新编：模型按清单顺序回，别用原始下标
+            candidate["_slot"] = slot
         listing = "\n\n".join(
-            f"候选 {candidate['_index']}：{candidate['content']}\n相近的已有记忆：\n" + "\n".join(
-                f"- {hit['id']}：{hit['content']}" for hit in candidate["similar"])
+            f"候选 {candidate['_slot']}：{candidate['content']}\n相近的已有记忆：\n" + "\n".join(
+                f"- {hit['id']}：{hit['content']}" + ("（手动添加，不可改写：只能 noop）"
+                                                      if hit["kind"] != "extracted" else "")
+                for hit in candidate["similar"])
             for candidate in judged)
+        decisions: list[dict[str, Any]] = []
         try:
             raw = await models.chat(workspace_id, chat_alias,
                                     [{"role": "system", "content": _JUDGE_PROMPT},
                                      {"role": "user", "content": listing}],
                                     response_format=JUDGE_SCHEMA, max_tokens=1024, background=True)
+            decisions = _parse_decisions(raw)
         except ModelCallError as error:
-            raise _job_error(error) from error  # 判定失败按可重试走：宁重试不静默写错
-        decisions = _parse_decisions(raw)
-        actions = {decision["index"]: decision for decision in decisions}
-        for candidate in kept:
-            decision = actions.get(candidate["_index"])
-            if decision is not None:
-                candidate["action"] = decision["action"]
-                candidate["target"] = decision["target"]
-                if decision["action"] in ("update", "replace") and decision.get("content"):
-                    candidate["content"] = decision["content"][:CONTENT_MAX_CHARS * 2]
+            # 判定失败降级：带相似命中的候选一律进待确认（宁待确认不静默写错，也不重付提取）
+            log.warning("memory extract: judge failed (%s); similar candidates go to pending", error.code)
+            for candidate in judged:
+                candidate["confidence"] = min(candidate["confidence"], ACTIVE_CONFIDENCE - 0.01)
+        else:
+            actions = {decision["slot"]: decision for decision in decisions}
+            forced_drops: list[dict[str, Any]] = []
+            for candidate in judged:
+                decision = actions.get(candidate["_slot"])
+                if decision is not None:
+                    candidate["action"] = decision["action"]
+                    candidate["target"] = decision["target"]
+                    if decision["action"] in ("update", "replace") and decision.get("content"):
+                        candidate["content"] = decision["content"][:CONTENT_MAX_CHARS * 2]
+                    if decision["action"] in ("update", "replace") and any(
+                            hit["id"] == decision["target"] and hit["kind"] != "extracted"
+                            for hit in candidate["similar"]):
+                        # 手动行不可改写（§7）：对手动行的同义重复，候选直接丢弃而非重复落库
+                        candidate["_force_drop"] = True
+                        forced_drops.append(candidate)
+            for candidate in forced_drops:
+                kept.remove(candidate)
 
-    return await service.store_extract(user_id, workspace_id, kept)
+    counts = await service.store_extract(user_id, workspace_id, kept)
+    counts["dropped"] += pre_dropped
+    return counts
 
 
 def _parse_decisions(raw: str) -> list[dict[str, Any]]:
@@ -241,7 +274,7 @@ def _parse_decisions(raw: str) -> list[dict[str, Any]]:
     for item in decisions:
         if not isinstance(item, dict) or item.get("action") not in ("noop", "update", "replace"):
             continue
-        parsed.append({"index": item.get("index"), "target": item.get("target"),
+        parsed.append({"slot": item.get("index"), "target": item.get("target"),
                        "action": item["action"], "content": item.get("content") or ""})
     return parsed
 
@@ -273,6 +306,8 @@ def build_contributor(service: MemoryService, profiles):
 
     async def contribute(ended) -> dict[str, Any] | None:
         try:
+            if ended.status != "completed":
+                return None  # 失败/中断轮次的残缺文本不进提取（设计 §5，错记忆伤信任）
             if ended.user_id is None or await _is_channel(profiles, ended.user_id):
                 return None
             if (await service.workspace_disabled(ended.workspace_id))["disabled"]:
@@ -297,4 +332,5 @@ async def _is_channel(profiles, user_id: str) -> bool:
         found = await profiles((user_id,))
         return getattr(found.get(user_id), "kind", "person") == "channel"
     except Exception:
+        log.warning("profile lookup for %s failed; treating as person", user_id, exc_info=True)
         return False

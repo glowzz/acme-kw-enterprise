@@ -48,7 +48,9 @@ class Enterprise:
 
     def setup_worker(self, ctx: Any) -> None:
         """worker 注册 memory.extract：模型别名按空间解析（环境变量可钉），没配模型时
-        handler 记日志收尾（注入不依赖提取，用户无感）。"""
+        handler 记日志收尾（注入不依赖提取，用户无感）。
+        WorkerContext.sessionmaker 是声明空间的工厂——memory 三张表是全局表、无 RLS 策略，
+        读写不受影响；worker 侧不 enqueue（提取在 api 入队），所以也不需要 set_workspace。"""
         service = MemoryService(ctx.sessionmaker)
         ctx.runner.register(EXTRACT, memory_extract.build_extract_handler(service, ctx.models),
                             on_give_up=memory_extract.log_give_up)
