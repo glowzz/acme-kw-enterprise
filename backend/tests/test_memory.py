@@ -354,6 +354,7 @@ async def test_export_and_clear(sessionmaker, service):
     await service.add("u1", type=PREFERENCE, content="回答用表格")
     await _insert(sessionmaker, "u1", status=ARCHIVED)
     await _insert(sessionmaker, "u2", status=ACTIVE, source="user")
+    await service.set_setting("u1", False)  # 开关行也要在 clear 时一并清掉（R4：原用例没造这行，断言恒真）
 
     exported = await service.export("u1")
     assert len(exported) == 2 and {item["status"] for item in exported} == {ACTIVE, ARCHIVED}
@@ -366,6 +367,30 @@ async def test_export_and_clear(sessionmaker, service):
     async with sessionmaker() as session:
         remaining = await session.scalar(select(func.count()).select_from(MemorySetting))
     assert int(remaining) == 0
+
+
+async def test_restore_superseded_is_capacity_neutral(sessionmaker, service):
+    """恢复「已被更新」净变化为零（后继归档、本行激活）：满额时不该误报 409。"""
+    superseded = await _insert(sessionmaker, "u1", status=SUPERSEDED)
+    await _insert(sessionmaker, "u1", status=ACTIVE, superseded_by=superseded)
+    async with sessionmaker() as session, session.begin():  # 凑满 200 生效中
+        session.add_all(Memory(id=f"mem_{uuid.uuid4().hex}", user_id="u1", type=FACT,
+                               content=f"凑数 {index}", status=ACTIVE)
+                        for index in range(ACTIVE_CAP - 1))
+    restored = await service.restore("u1", superseded)  # 后继先归档腾出一席，恢复不该撞满额
+    assert restored["status"] == ACTIVE
+
+
+async def test_restore_round_trip_stays_exclusive(sessionmaker, service):
+    """恢复是双向互斥的：旧版复活后，再恢复被归档的后继时旧版要让位，矛盾对永远只有一个生效。"""
+    new_id = await _insert(sessionmaker, "u1", status=ACTIVE, content="新版表述")
+    old_id = await _insert(sessionmaker, "u1", status=SUPERSEDED, content="旧版表述", superseded_by=new_id)
+    await service.restore("u1", old_id)   # 旧版复活、新版归档（R3 用例）
+    # 再恢复新版：旧版要让位（R4：单向互斥会在这里复活两条）
+    restored_back = await service.restore("u1", new_id)
+    assert restored_back["status"] == ACTIVE
+    statuses = {item["id"]: item["status"] for item in await service.export("u1")}
+    assert statuses[new_id] == ACTIVE and statuses[old_id] == ARCHIVED
 
 
 # ---- 路由层：状态码映射与请求体校验（stub service，不起真实依赖） ----

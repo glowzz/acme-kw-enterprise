@@ -170,21 +170,38 @@ class MemoryService:
         """已归档 / 已被更新 → 生效中；满额 409（提示先删几条）。
 
         两个连带语义（R3 审查补）：
-        - 过期归档的在办事项恢复 = 再给一个默认期限窗口，不然一恢复下一次整理又把它归档，等于白点；
-        - 恢复「已被更新」的旧版本时，把取代它的那条归档——新旧互斥，不然两条矛盾记忆同时注入。"""
+        - 恢复是否认它的全部后继（R4 审查补的双向互斥）：沿取代链正向（superseded_by）与反向
+          （谁指向我）找到仍然生效的后继，全部归档并指回本行——只做单向的话，恢复后继会把
+          矛盾的一对同时复活；
+        - 链处理是容量中性的（归档若干、激活一条），所以先做互斥再查容量，容量中性的恢复不会误报满额；
+        - 过期归档的在办事项恢复 = 再给一个默认期限窗口，不然一恢复下一次整理又把它归档，等于白点。"""
         async with self._sessionmaker() as session, session.begin():
             row = await _owned(session, user_id, memory_id)
             if row.status not in (ARCHIVED, SUPERSEDED):
                 raise Conflict("只有已归档或已被更新的记忆可以恢复")
+            chain = [row.superseded_by] if row.superseded_by else []
+            pointed = await session.scalars(select(Memory.id).where(
+                Memory.user_id == user_id, Memory.superseded_by == row.id, Memory.status == ACTIVE))
+            chain.extend(pointed)
+            seen: set[str] = set()
+            while chain:
+                successor_id = chain.pop()
+                if successor_id in seen:
+                    continue
+                seen.add(successor_id)
+                successor = await session.get(Memory, successor_id)
+                if successor is None or successor.user_id != user_id:
+                    continue
+                if successor.status == ACTIVE:
+                    successor.status = ARCHIVED
+                    successor.superseded_by = row.id  # 指回本行：将来恢复它时找得到对手
+                if successor.superseded_by and successor.superseded_by != row.id:
+                    chain.append(successor.superseded_by)
             await _require_capacity(session, user_id)
             if row.type == TASK and row.expires_at is not None and row.expires_at <= _now():
                 row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
-            if row.status == SUPERSEDED and row.superseded_by:
-                successor = await session.get(Memory, row.superseded_by)
-                if successor is not None and successor.user_id == user_id and successor.status == ACTIVE:
-                    successor.status = ARCHIVED
             row.status = ACTIVE
-            row.superseded_by = None
+            row.superseded_by = None  # 本行现役；被它压下去的后继各自指着它，链没断
             view = _view(row)
         return view
 

@@ -114,8 +114,8 @@ function EditDialog({ item, onClose }: { readonly item: MemoryItem; readonly onC
         ...(contentChanged ? { content: content.trim() } : {}),
         ...(isTask && dateChanged
           ? deadline
-            ? // 本地当天零点（解析成本地时刻再转 UTC）：选「今天」就是今天 23:59 前都有效
-              { expiresAt: new Date(`${deadline}T00:00:00`).toISOString() }
+            ? // 本地当天最后一刻（23:59:59）转 UTC：选「今天」含当天全天，下午操作不算已过期
+              { expiresAt: new Date(`${deadline}T23:59:59`).toISOString() }
             : { clearExpires: true }
           : {}),
       }),

@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -86,7 +87,8 @@ class MemorySetting(Base):
 
     user_id: Mapped[str] = mapped_column(String(32), ForeignKey("user.id", ondelete="CASCADE"),
                                          primary_key=True)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 与迁移的 sa.true()/sa.false() 对齐：裸 SQL 插入两条路径同构
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     last_organized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
                                                  onupdate=func.now())
@@ -100,6 +102,6 @@ class MemoryWorkspaceSetting(Base):
     __tablename__ = "memory_workspace_setting"
 
     workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    disabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
                                                  onupdate=func.now())
