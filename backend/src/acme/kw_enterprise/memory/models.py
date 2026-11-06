@@ -37,6 +37,8 @@ CONTENT_MAX = 500   # 一句第三人称陈述，页面与迁移的长度约束�
 QUOTE_MAX = 200     # 提取时逐字摘录的用户原话上限
 TASK_TTL_DAYS = 30  # 在办事项的默认期限（天）：期限不让提取模型猜日期，编辑里可改（设计 §5）
 ACTIVE_CONFIDENCE = 0.8  # 提取置信度门槛：过线且有原话出处直接生效，否则进待确认（设计 §1）
+DECAY_FACTOR = 0.85      # 整理的月度衰减系数：整月未被 turn 段提及则 score ×0.85（设计 §7）
+ARCHIVE_BELOW = 0.15     # 衰减到这条线以下归档（可恢复）
 
 
 class Memory(Base):

@@ -13,19 +13,25 @@ from typing import Any
 
 from knowwork_server.access.rls import set_workspace
 from knowwork_server.jobs.queue import enqueue
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from .dedup import cosine
 from .jobs import EXTRACT, ORGANIZE
 from .models import (
     ACTIVE,
     ACTIVE_CAP,
     ACTIVE_CONFIDENCE,
+    ARCHIVE_BELOW,
     ARCHIVED,
+    BY_TOOL,
     BY_USER,
     CONTENT_MAX,
+    DECAY_FACTOR,
     EXTRACTED,
+    FACT,
+    FOCUS,
     PENDING,
     SUPERSEDED,
     TASK,
@@ -432,6 +438,158 @@ class MemoryService:
                     superseded_by=superseded_by, **base))
                 counts["active" if status == ACTIVE else "pending"] += 1
         return counts
+
+    # ---- M3：整理链路的原语（人工优先：合并/降权/腾位只动 source=extracted，设计 §7） ----
+
+    async def archive_expired(self, user_id: str) -> int:
+        """步骤 1 过期清理：pending 超 30 天、在办事项期限已过 → archived。
+        到期清理对所有来源生效（期限是用户自己声明的语义，R3 定口径）。"""
+        async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)
+            r1 = await session.execute(update(Memory).where(
+                Memory.user_id == user_id, Memory.status == PENDING,
+                Memory.created_at < _now() - timedelta(days=TASK_TTL_DAYS)).values(status=ARCHIVED))
+            r2 = await session.execute(update(Memory).where(
+                Memory.user_id == user_id, Memory.type == TASK, Memory.status == ACTIVE,
+                Memory.expires_at.isnot(None), Memory.expires_at <= _now()).values(status=ARCHIVED))
+            return (r1.rowcount or 0) + (r2.rowcount or 0)
+
+    async def merge_candidates(self, user_id: str, *, limit_pairs: int = 20,
+                               threshold: float = 0.90) -> list[dict[str, Any]]:
+        """步骤 2 的候选对：extracted 且 ACTIVE、有向量、余弦 ≥0.90 的对子（贪心配对，
+        一行至多进一对）。LLM 判定合并与否在这里之外做。"""
+        async with self._sessionmaker() as session:
+            rows = await session.scalars(select(Memory).where(
+                Memory.user_id == user_id, Memory.status == ACTIVE,
+                Memory.source == EXTRACTED, Memory.embedding.isnot(None)).order_by(Memory.score.desc()))
+            items = [{"id": row.id, "content": row.content, "embedding": row.embedding} for row in rows]
+        pairs: list[dict[str, Any]] = []
+        used: set[str] = set()
+        for i, a in enumerate(items):
+            if a["id"] in used:
+                continue
+            for b in items[i + 1:]:
+                if b["id"] in used or cosine(a["embedding"], b["embedding"]) < threshold:
+                    continue
+                pairs.append({"a_id": a["id"], "a_content": a["content"],
+                              "b_id": b["id"], "b_content": b["content"]})
+                used.update((a["id"], b["id"]))
+                break
+            if len(pairs) >= limit_pairs:
+                break
+        return pairs
+
+    async def apply_merges(self, user_id: str, merges: Sequence[dict[str, Any]]) -> int:
+        """步骤 2 落库：keep 行改写为合并表述、drop 行 archived（指回 keep，可恢复可导航）。"""
+        async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)
+            applied = 0
+            for merge in merges:
+                keep = await session.get(Memory, merge["keep_id"])
+                drop = await session.get(Memory, merge["drop_id"])
+                if (keep is None or drop is None or keep.user_id != user_id or drop.user_id != user_id
+                        or keep.status != ACTIVE or drop.status != ACTIVE
+                        or keep.source != EXTRACTED or drop.source != EXTRACTED):
+                    continue
+                keep.content = _content_of(merge["content"])
+                keep.embedding = None  # 合并表述是新内容，旧向量作废，步骤 5 补算
+                keep.embedding_model = None
+                drop.status = ARCHIVED
+                drop.superseded_by = keep.id
+                applied += 1
+            return applied
+
+    async def decay_scores(self, user_id: str) -> int:
+        """步骤 3 降权：fact/focus 且 extracted 的，按整月 gap 每月 ×0.85；score <0.15 → archived。
+        preference 稳定不衰减、task 靠期限、手动/工具行不参与。"""
+        async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)
+            rows = await session.scalars(select(Memory).where(
+                Memory.user_id == user_id, Memory.status == ACTIVE, Memory.source == EXTRACTED,
+                Memory.type.in_((FACT, FOCUS))))
+            archived = 0
+            for row in rows:
+                anchor = row.last_mentioned_at or row.created_at
+                gap_months = max(0, ( (_now() - anchor).days // 30 ))
+                if gap_months <= 0:
+                    continue
+                row.score = row.score * (DECAY_FACTOR ** gap_months)
+                if row.score < ARCHIVE_BELOW:
+                    row.status = ARCHIVED
+                    archived += 1
+            return archived
+
+    async def trim_active(self, user_id: str, cap: int = ACTIVE_CAP) -> int:
+        """步骤 4 腾位：手动/工具行不计入可腾名额——extracted 的生效行数压到
+        「cap − 手动生效数」以内，从 score 最低的开始 archived。"""
+        async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)
+            manual = await session.scalar(select(func.count()).select_from(Memory).where(
+                Memory.user_id == user_id, Memory.status == ACTIVE,
+                Memory.source.in_((BY_USER, BY_TOOL))))
+            allowed = max(0, cap - int(manual or 0))
+            rows = await session.scalars(select(Memory).where(
+                Memory.user_id == user_id, Memory.status == ACTIVE, Memory.source == EXTRACTED)
+                .order_by(Memory.score.asc(), Memory.id))
+            extracted = list(rows)
+            over = len(extracted) - allowed
+            archived = 0
+            for row in extracted[:max(0, over)]:
+                row.status = ARCHIVED
+                archived += 1
+            return archived
+
+    async def stale_vector_rows(self, user_id: str, alias: str, *,
+                                limit: int = 96) -> list[dict[str, Any]]:
+        """步骤 5 的补算清单：向量缺失或嵌入模型换了（维度/口径都不齐）的行，全部状态都补。"""
+        async with self._sessionmaker() as session:
+            rows = await session.scalars(select(Memory).where(
+                Memory.user_id == user_id,
+                or_(Memory.embedding.is_(None), Memory.embedding_model != alias)).limit(limit))
+            return [{"id": row.id, "content": row.content} for row in rows]
+
+    async def store_vectors(self, user_id: str, alias: str,
+                            items: Sequence[dict[str, Any]]) -> int:
+        """步骤 5 落库：{id, embedding} 列表回写。"""
+        async with self._sessionmaker() as session, session.begin():
+            for item in items:
+                row = await session.get(Memory, item["id"])
+                if row is not None and row.user_id == user_id:
+                    row.embedding = item["embedding"]
+                    row.embedding_model = alias
+            return len(items)
+
+    # ---- M3：「记住」工具的原语 ----
+
+    async def remember_insert(self, user_id: str, workspace_id: str, content: str, kind: str,
+                              embedding: list[float] | None = None) -> dict[str, Any]:
+        """工具写入：用户亲口说的，直接生效、source=tool；满额明确报错（工具能向用户解释）。"""
+        content = _content_of(content)
+        async with self._sessionmaker() as session, session.begin():
+            await _require_capacity(session, user_id)
+            row = Memory(id=f"mem_{uuid.uuid4().hex}", user_id=user_id, type=kind, content=content,
+                         source=BY_TOOL, status=ACTIVE, score=1.0,
+                         origin_workspace_id=workspace_id, embedding=embedding,
+                         expires_at=_now() + timedelta(days=TASK_TTL_DAYS) if kind == TASK else None)
+            session.add(row)
+            view = _view(row)
+        return view
+
+    async def remember_update(self, user_id: str, memory_id: str, content: str, kind: str) -> dict[str, Any]:
+        """工具改写近重复的旧说法：内容/类型按用户新表述，向量作废待整理补算，记账 +1。"""
+        content = _content_of(content)
+        async with self._sessionmaker() as session, session.begin():
+            row = await _owned(session, user_id, memory_id)
+            if row.status != ACTIVE:
+                raise Conflict("只有生效中的记忆可以更新")
+            row.content = content
+            row.type = kind
+            row.embedding = None
+            row.embedding_model = None
+            row.mention_count += 1
+            row.last_mentioned_at = _now()
+            view = _view(row)
+        return view
 
     # ---- 导出与清空 ----
 

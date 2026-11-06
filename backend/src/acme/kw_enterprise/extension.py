@@ -11,12 +11,16 @@ setup_worker 注册 memory.extract 的 handler。
 from pathlib import Path
 from typing import Any
 
+from knowwork_server.tools.provided import ProvidedTool
+
 from . import mcp_api, skills_api, workspaces_api
 from .license import MODULE
 from .memory import api as memory_api
 from .memory import extract as memory_extract
+from .memory import organize as memory_organize
+from .memory import tool as memory_tool
 from .memory.context import MemoryContext
-from .memory.jobs import EXTRACT
+from .memory.jobs import EXTRACT, ORGANIZE
 from .memory.service import MemoryService
 
 # 记忆层的迁移分支：装包就升级，不看授权（contract 的约定）
@@ -31,12 +35,14 @@ class Enterprise:
     migrations = MEMORY_MIGRATIONS
 
     def setup_api(self, ctx: Any):
-        """业务服务启动时装配：路由 + 每轮上下文提供者 + 回合结束的提取入队。
-        MemoryService 三处共用一份（路由 / 提供者 / 贡献者），装配期构造一次。"""
+        """业务服务启动时装配：路由 + 每轮上下文提供者 + 回合结束的提取入队 + 「记住」工具。
+        MemoryService 共用一份（路由 / 提供者 / 贡献者 / 工具），装配期构造一次。"""
         service = MemoryService(ctx.global_sessionmaker, ctx.access)
         context = MemoryContext(service, ctx.models, ctx.profiles)
         ctx.turn_context.add(context.provider)  # v0.0.6：多提供者按登记顺序拼，出错整轮不带
         ctx.on_turn_ended("memory", memory_extract.build_contributor(service, ctx.profiles))
+        remember, available = memory_tool.build_remember_tool(service, ctx.models)
+        ctx.tools.add(ProvidedTool(tool=remember, available=available))
         return [workspaces_api.build_router(ctx),
                 skills_api.build_router(ctx),
                 mcp_api.build_router(ctx),
@@ -47,13 +53,15 @@ class Enterprise:
         return []
 
     def setup_worker(self, ctx: Any) -> None:
-        """worker 注册 memory.extract：模型别名按空间解析（环境变量可钉），没配模型时
-        handler 记日志收尾（注入不依赖提取，用户无感）。
+        """worker 注册 memory.extract（core 池）与 memory.organize（maintenance 池）：
+        模型别名按空间解析（环境变量可钉），没配模型时 handler 记日志收尾（注入不依赖提取）。
         WorkerContext.sessionmaker 是声明空间的工厂——memory 三张表是全局表、无 RLS 策略，
         读写不受影响；worker 侧不 enqueue（提取在 api 入队），所以也不需要 set_workspace。"""
         service = MemoryService(ctx.sessionmaker)
         ctx.runner.register(EXTRACT, memory_extract.build_extract_handler(service, ctx.models),
                             on_give_up=memory_extract.log_give_up)
+        ctx.runner.register(ORGANIZE, memory_organize.build_organize_handler(service, ctx.models),
+                            on_give_up=memory_organize.log_give_up)
 
     async def start(self) -> None:
         """开始服务前调用：没有要预热的数据。"""

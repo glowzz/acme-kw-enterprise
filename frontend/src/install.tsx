@@ -22,4 +22,15 @@ export function install(register: Register): void {
   register('admin.tools.enterprise', { children: <ToolsEnterprisePanel /> });
   // 个人设置 → 我的记忆：对话里「管理记忆」的深链是 /settings?tab=memory（chat.tools 的 notice 用）
   register('settings.tabs', { key: 'memory', label: '我的记忆', children: <MemoryTab /> });
+  // 「记住」工具在执行过程里的显示名与完成提示（回答下方一行，直达设置页）
+  register('chat.tools', {
+    name: 'remember',
+    label: '记住',
+    target: 'content',
+    notice: (call) => {
+      const content = typeof call.arguments.content === 'string' ? call.arguments.content : '';
+      if (!content || !call.result.startsWith('已记住')) return null;
+      return { text: `已记住：${content}`, link: { label: '管理记忆', to: '/settings?tab=memory' } };
+    },
+  });
 }

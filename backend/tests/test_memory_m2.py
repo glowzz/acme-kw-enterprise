@@ -228,10 +228,13 @@ async def test_extract_skips_guarded_and_short(sessionmaker):
 async def test_worker_handler_reads_payload(sessionmaker):
     service = MemoryService(sessionmaker, FakeAccess())
     handler = build_extract_handler(service, FakeModels([_extract_reply({"content": "喜欢深色主题"})]))
+    # M3 起 handler 返回 None（Done 契约）：落库结果以记忆表为准
     result = await handler(_JobContext({"user_id": "u1", "conversation_id": "c1", "turn": 3,
                                         "question": "换成深色主题吧，" + "界面太刺眼了，" * 6,
                                         "answer": "已切换到深色主题，" + "后续回答都会按它来，" * 6}))
-    assert result is not None and result["active"] == 1
+    assert result is None
+    items, _ = await service.page("u1", status="active")
+    assert any(item["content"] == "喜欢深色主题" for item in items)
 
 
 class _JobContext:

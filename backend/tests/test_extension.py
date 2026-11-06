@@ -60,6 +60,9 @@ def _build_ctx():
     ctx.profiles = None  # type: ignore[attr-defined]
     ctx.turn_context = _Recorder()  # type: ignore[attr-defined]  v0.0.6：多提供者 add
     ctx.on_turn_ended = _Recorder()  # type: ignore[attr-defined]  contribute(名字, 函数)
+    from knowwork_server.tools.provided import ProvidedTools
+
+    ctx.tools = ProvidedTools()  # type: ignore[attr-defined]  M3「记住」工具登记到这里
     return ctx
 
 
@@ -147,12 +150,13 @@ def test_memory_routes() -> None:
 
 
 def test_memory_wiring() -> None:
-    """M2 的三个挂接点：每轮上下文提供者、回合结束的提取贡献者、worker 的提取任务。"""
+    """M2/M3 的挂接点：提供者、提取贡献者、「记住」工具、worker 的两个任务。"""
     ctx = _build_ctx()
     extension = installed_extensions().active[0]
     extension.setup_api(ctx)
     assert len(ctx.turn_context.items) == 1, "登记了一个每轮上下文提供者（turn_context.add）"
     assert ctx.on_turn_ended.items and ctx.on_turn_ended.items[0][0] == "memory", "贡献者挂在 memory 名下"
+    assert ctx.tools.names() == frozenset({"remember"}), "M3 的「记住」工具已登记"
 
     registered: dict = {}
 
@@ -166,4 +170,4 @@ def test_memory_wiring() -> None:
         models = None
 
     extension.setup_worker(_WorkerCtx())
-    assert "memory.extract" in registered
+    assert set(registered) == {"memory.extract", "memory.organize"}
