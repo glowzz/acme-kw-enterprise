@@ -409,8 +409,10 @@ class MemoryService:
                     row.embedding = base["embedding"]      # 改写后的内容配候选的向量
                     row.embedding_model = base["embedding_model"]
                     row.score = max(row.score, confidence)
-                    if base["type"] == TASK:               # 期限归属跟最终类型走（与 edit 同不变式）
-                        row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
+                    # 期限跟最终类型走；已有期限保留（与 edit 同口径）
+                    if base["type"] == TASK:
+                        if row.expires_at is None:
+                            row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
                     else:
                         row.expires_at = None
                     row.mention_count += 1
@@ -500,13 +502,16 @@ class MemoryService:
                 applied += 1
             return applied
 
-    async def decay_scores(self, user_id: str, last_organized_at: datetime | None = None) -> int:
+    async def decay_scores(self, user_id: str) -> int:
         """步骤 3 降权：fact/focus 且 extracted 的，按整月 gap 每月 ×0.85；score <0.15 → archived。
         preference 稳定不衰减、task 靠期限、手动/工具行不参与。
-        衰减是**增量**的（R2 修正）：只应用「上次整理之后」新累积的整月数——score 是上次衰减后
-        的值，若每次都对全量 gap 再乘一遍，每天一次的整理会在两周内清空所有一个月没被提及的行。"""
+        衰减是**增量**的（R2 修正）：只应用「上次实际衰减之后」新累积的整月数——score 是上次衰减后
+        的值，若每次都对全量 gap 再乘一遍，每天一次的整理会在两周内清空所有一个月没被提及的行。
+        水位的读与写收在本事务内（同一把锁）：并发双跑/失败重试都不会重复应用同一增量。"""
         async with self._sessionmaker() as session, session.begin():
             await _acquire_capacity_lock(session, user_id)
+            setting = await session.get(MemorySetting, user_id)
+            watermark = setting.last_decayed_at if setting is not None else None
             rows = await session.scalars(select(Memory).where(
                 Memory.user_id == user_id, Memory.status == ACTIVE, Memory.source == EXTRACTED,
                 Memory.type.in_((FACT, FOCUS))))
@@ -515,8 +520,8 @@ class MemoryService:
                 anchor = row.last_mentioned_at or row.created_at
                 total_months = (_now() - anchor).days // 30
                 applied_months = 0
-                if last_organized_at is not None:
-                    applied_months = max(0, (last_organized_at - anchor).days // 30)
+                if watermark is not None:
+                    applied_months = max(0, (watermark - anchor).days // 30)
                 incremental = max(0, total_months - applied_months)
                 if incremental <= 0:
                     continue
@@ -524,6 +529,11 @@ class MemoryService:
                 if row.score < ARCHIVE_BELOW:
                     row.status = ARCHIVED
                     archived += 1
+            # 衰减水位在同一事务里推进：排队标记（last_organized_at）≠ 已衰减，两者别合并
+            if setting is None:
+                session.add(MemorySetting(user_id=user_id, enabled=True, last_decayed_at=_now()))
+            else:
+                setting.last_decayed_at = _now()
             return archived
 
     async def trim_active(self, user_id: str, cap: int = ACTIVE_CAP) -> int:

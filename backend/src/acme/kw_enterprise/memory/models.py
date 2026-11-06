@@ -84,7 +84,12 @@ class Memory(Base):
 
 
 class MemorySetting(Base):
-    """个人记忆开关；没有行 = 默认开启。last_organized_at 兼作「今天整理过没有」的标记（M3 用）。"""
+    """个人记忆开关；没有行 = 默认开启。
+
+    两个时间戳语义不同（M3-R2 拆分，别合并）：
+    - last_organized_at：整理任务**排队**标记——提供者入队成功即写，防「每天一次」退化成每轮一次；
+    - last_decayed_at：**实际衰减**水位——整理任务在衰减的同一事务里写，衰减增量按它计算
+      （排队标记 ≠ 已衰减，混用会让自动链路的衰减常态为 0）。"""
 
     __tablename__ = "memory_setting"
 
@@ -93,6 +98,7 @@ class MemorySetting(Base):
     # 与迁移的 sa.true()/sa.false() 对齐：裸 SQL 插入两条路径同构
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     last_organized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_decayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
                                                  onupdate=func.now())
 

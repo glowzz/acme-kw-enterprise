@@ -70,14 +70,28 @@ class RememberTool:
         if (await self._service.workspace_disabled(ctx.workspace_id))["disabled"]:
             raise ToolFailure("本空间已停用记忆功能")
 
-        # 一次 embed 同时用于判重与落库（别花两次交互额度）
-        alias, vector = await self._embed(ctx.workspace_id, content)
-        target = await self._near_duplicate(ctx.user_id, content, alias, vector)
-        try:
-            if target is not None:
-                await self._service.remember_update(ctx.user_id, target["id"], content, kind)
+        # 签名判重先行（零成本）：命中的直接走更新，省一次嵌入往返；只有未命中才 embed
+        # （一次 embed 同时用于向量判重与落库，别花两次交互额度）
+        pool = await self._service.dedup_pool(ctx.user_id)
+        for row in pool:
+            if row["status"] == ACTIVE and signature(row["content"]) == signature(content):
+                try:
+                    await self._service.remember_update(ctx.user_id, row["id"], content, kind)
+                except MemoryError as error:
+                    raise ToolFailure(str(error)) from error
                 return f"已记住（更新了原来的说法）：{content}。可在 设置 → 我的记忆 中管理。"
 
+        alias, vector = await self._embed(ctx.workspace_id, content)
+        for row in pool:
+            if row["status"] == ACTIVE and row["embedding"] and vector and \
+                    cosine(vector, row["embedding"]) >= SIMILAR_UPDATE_THRESHOLD:
+                try:
+                    await self._service.remember_update(ctx.user_id, row["id"], content, kind)
+                except MemoryError as error:
+                    raise ToolFailure(str(error)) from error
+                return f"已记住（更新了原来的说法）：{content}。可在 设置 → 我的记忆 中管理。"
+
+        try:
             await self._service.remember_insert(ctx.user_id, ctx.workspace_id, content, kind,
                                                 embedding=vector, embedding_model=alias)
         except MemoryError as error:
@@ -94,21 +108,6 @@ class RememberTool:
         except Exception:
             return False
 
-    async def _near_duplicate(self, user_id: str, content: str, alias: str | None,
-                              vector: list[float] | None) -> dict[str, Any] | None:
-        """签名精确重复 → 那一条；向量近重复（用户亲口说的，新表述为准）→ 那一条。"""
-        pool = await self._service.dedup_pool(user_id)
-        for row in pool:
-            if row["status"] == ACTIVE and signature(row["content"]) == signature(content):
-                return row
-        if vector is None:
-            return None
-        for row in pool:
-            if row["status"] == ACTIVE and row["embedding"] and \
-                    cosine(vector, row["embedding"]) >= SIMILAR_UPDATE_THRESHOLD:
-                return row
-        return None
-
     async def _embed(self, workspace_id: str, content: str) -> tuple[str | None, list[float] | None]:
         """向量 best-effort：没配嵌入模型或调用失败都返回 (None, None)，不影响记忆生效。"""
         if self._models is None:
@@ -123,16 +122,6 @@ class RememberTool:
         except Exception:
             log.warning("remember embedding skipped (best-effort)", exc_info=True)
             return None, None
-
-    async def _embed_alias(self, workspace_id: str) -> str | None:
-        if self._models is None:
-            return None
-        try:
-            return await resolve_model(self._models, workspace_id, Capability.EMBEDDING,
-                                       EMBED_MODEL_ENV)
-        except Exception:
-            log.warning("remember embed alias lookup failed", exc_info=True)
-            return None
 
 
 def build_remember_tool(service: MemoryService, models: ModelClient | None,

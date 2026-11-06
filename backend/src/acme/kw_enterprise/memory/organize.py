@@ -54,7 +54,6 @@ async def organize_user(service: MemoryService, models: ModelClient | None,
 
     counts: dict[str, Any] = {}
     counts["expired"] = await service.archive_expired(user_id)
-    last_organized_at = (await service.setting(user_id))["lastOrganizedAt"]
 
     pairs = await service.merge_candidates(user_id)
     merges: list[dict[str, Any]] = []
@@ -86,7 +85,7 @@ async def organize_user(service: MemoryService, models: ModelClient | None,
     counts["merged"] = await service.apply_merges(user_id, merges) if merges else 0
     counts["pairs"] = len(pairs)
 
-    counts["decayed_archived"] = await service.decay_scores(user_id, last_organized_at)
+    counts["decayed_archived"] = await service.decay_scores(user_id)  # 水位在衰减事务内自读自写
     counts["trimmed"] = await service.trim_active(user_id)
 
     embed_alias = await resolve_model(models, workspace_id, Capability.EMBEDDING, EMBED_MODEL_ENV) \
@@ -102,11 +101,11 @@ async def organize_user(service: MemoryService, models: ModelClient | None,
             except ModelCallError as error:
                 log.warning("memory organize: revector failed (%s); lazy retry next day", error.code)
                 break
-            await service.store_vectors(user_id, embed_alias,
-                                        [{"id": item["id"], "content": item["content"],
-                                          "embedding": vector}
-                                         for item, vector in zip(batch, vectors, strict=True)])
-            counts["revectored"] += len(batch)
+            stored = await service.store_vectors(user_id, embed_alias,
+                                                 [{"id": item["id"], "content": item["content"],
+                                                   "embedding": vector}
+                                                  for item, vector in zip(batch, vectors, strict=True)])
+            counts["revectored"] += stored  # 按 store_vectors 实际写入数计（跳过行不算）
 
     await service.mark_organized(user_id)
     return counts
