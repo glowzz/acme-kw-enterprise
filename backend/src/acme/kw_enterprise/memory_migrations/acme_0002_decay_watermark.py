@@ -15,10 +15,8 @@ depends_on = None
 def upgrade() -> None:
     op.add_column("memory_setting", sa.Column("last_decayed_at", sa.DateTime(timezone=True),
                                               nullable=True))
-    # 回填：旧实现按 last_organized_at 做过增量衰减，存量 score 已反映到那一刻——
-    # 不回填的话升级后水位为 NULL，首次整理会从头再衰减一遍（R3 审查）
-    op.execute("UPDATE memory_setting SET last_decayed_at = last_organized_at "
-               "WHERE last_organized_at IS NOT NULL")
+    # 回填在 acme_0003：本 revision 已被 R2 构建的环境 stamp 过，原地加语句它们永远执行不到
+    # （已应用的迁移绝不原地改——R4 审查的纪律教训）
 
 
 def downgrade() -> None:

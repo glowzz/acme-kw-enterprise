@@ -335,15 +335,18 @@ class MemoryService:
                      "score": row.score, "embedding": row.embedding,
                      "expiresAt": row.expires_at} for row in rows]
 
-    async def dedup_pool(self, user_id: str) -> list[dict[str, Any]]:
+    async def dedup_pool(self, user_id: str, *, with_embeddings: bool = True) -> list[dict[str, Any]]:
         """判重的比对池：生效中 + 待确认的记忆（id/内容/来源/向量）。提取落库前对它算签名、
         否定极性与余弦；归档与已被更新的不参与（它们不会再注入）。source 给判定清单标注
-        「手动添加不可改写」（人工优先，§7）。"""
+        「手动添加不可改写」（人工优先，§7）。
+        with_embeddings=False 给只做签名判重的调用方（remember 的首次取池）：省 200 行
+        JSONB 向量的传输，向量留给 embed 之后的重取那一次。"""
         async with self._sessionmaker() as session:
             rows = await session.scalars(select(Memory).where(
                 Memory.user_id == user_id, Memory.status.in_((ACTIVE, PENDING))))
             return [{"id": row.id, "content": row.content, "status": row.status,
-                     "source": row.source, "embedding": row.embedding} for row in rows]
+                     "source": row.source,
+                     "embedding": row.embedding if with_embeddings else None} for row in rows]
 
     async def track_mentions(self, user_id: str, memory_ids: Sequence[str]) -> None:
         """记账只记 turn 段命中的条目（standing 常驻不算提及——按「在场」记账会让衰减永不触发，
@@ -409,7 +412,8 @@ class MemoryService:
                     row.embedding = base["embedding"]      # 改写后的内容配候选的向量
                     row.embedding_model = base["embedding_model"]
                     row.score = max(row.score, confidence)
-                    # 期限跟最终类型走；已有期限保留（与 edit 同口径）
+                    # 期限跟最终类型走；已有期限保留（提取改写=有新进展，不主动续期——
+                    # 「还在办就续期」是工具场景口径，两处场景不同）
                     if base["type"] == TASK:
                         if row.expires_at is None:
                             row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
@@ -605,7 +609,9 @@ class MemoryService:
 
     async def remember_update(self, user_id: str, memory_id: str, content: str, kind: str) -> dict[str, Any]:
         """工具改写近重复的旧说法：内容/类型按用户新表述，向量作废待整理补算，记账 +1。
-        期限归属跟最终类型走（与 edit 同一不变式：task 补默认期限，非 task 摘掉）。"""
+        期限口径（工具场景，与 edit 的表单场景有意不同）：非 task 摘掉；task 无期限 → 补默认；
+        task 已过期 → 续一个默认窗口（用户重述在办事项=还在办，与 restore 同口径）；
+        task 未过期 → 保留用户改过的期限（R3 审查：无条件重置会吞掉自定义期限）。"""
         content = _content_of(content)
         async with self._sessionmaker() as session, session.begin():
             await _acquire_capacity_lock(session, user_id)  # 与整理的补向量互斥：防旧向量覆写新内容行
@@ -616,10 +622,10 @@ class MemoryService:
             row.type = kind
             row.embedding = None
             row.embedding_model = None
-            if kind == TASK and row.expires_at is None:
-                row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)  # 只补空缺：task→task 保留用户期限
-            elif kind != TASK:
+            if kind != TASK:
                 row.expires_at = None
+            elif row.expires_at is None or row.expires_at <= _now():
+                row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
             row.mention_count += 1
             row.last_mentioned_at = _now()
             view = _view(row)

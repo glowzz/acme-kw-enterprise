@@ -70,9 +70,8 @@ class RememberTool:
         if (await self._service.workspace_disabled(ctx.workspace_id))["disabled"]:
             raise ToolFailure("本空间已停用记忆功能")
 
-        # 签名判重先行（零成本）：命中的直接走更新，省一次嵌入往返；只有未命中才 embed
-        # （一次 embed 同时用于向量判重与落库，别花两次交互额度）
-        pool = await self._service.dedup_pool(ctx.user_id)
+        # 签名判重先行（零成本，轻量取池不带向量）：命中的直接走更新，省一次嵌入往返
+        pool = await self._service.dedup_pool(ctx.user_id, with_embeddings=False)
         for row in pool:
             if row["status"] == ACTIVE and signature(row["content"]) == signature(content):
                 try:
@@ -83,8 +82,15 @@ class RememberTool:
 
         alias, vector = await self._embed(ctx.workspace_id, content)
         if vector is not None:
-            # embed 有耗时：向量判重前重取池，别用旧快照漏掉 embed 期间新写入的行（R3 审查 C）
+            # embed 有耗时：向量判重前重取池（这次带向量），并对 embed 期间新写入的行补一次签名判重
             pool = await self._service.dedup_pool(ctx.user_id)
+            for row in pool:
+                if row["status"] == ACTIVE and signature(row["content"]) == signature(content):
+                    try:
+                        await self._service.remember_update(ctx.user_id, row["id"], content, kind)
+                    except MemoryError as error:
+                        raise ToolFailure(str(error)) from error
+                    return f"已记住（更新了原来的说法）：{content}。可在 设置 → 我的记忆 中管理。"
         for row in pool:
             if row["status"] == ACTIVE and row["embedding"] and vector and \
                     cosine(vector, row["embedding"]) >= SIMILAR_UPDATE_THRESHOLD:

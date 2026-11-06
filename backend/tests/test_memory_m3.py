@@ -419,60 +419,55 @@ async def test_remember_update_preserves_custom_task_expiry(sessionmaker, servic
 
 
 async def test_migration_backfills_decay_watermark(pg_url):
-    """R3：升级到 acme_0002 时，旧的排队标记回填成衰减水位——存量行不被重新衰减。"""
-    import shutil
-    import tempfile
+    """R4：升级到 acme_0003 时，排队标记回填成衰减水位——存量行不被重新衰减；
+    从未整理的行（水位 NULL）保持 NULL，不虚构历史。acme_0003 独立成 revision
+    （R4 审查：acme_0002 已被 stamp 过的环境拿不到原地追加的语句）。"""
     import uuid as uuid_mod
 
-    import pgserver
     from alembic import command
     from knowwork_server.db.migrate import Branches, alembic_config
     from sqlalchemy import text
 
+    name = f"mig3_{uuid_mod.uuid4().hex[:12]}"
+    admin = create_async_engine(pg_url, isolation_level="AUTOCOMMIT")
+    async with admin.connect() as connection:
+        await connection.execute(text(f'CREATE DATABASE "{name}"'))
+    url = pg_url.replace("/postgres?", f"/{name}?")
+    branches = Branches(locations=(MEMORY_MIGRATIONS,),
+                        model_modules=("acme.kw_enterprise.memory.models",))
 
-    data_dir = tempfile.mkdtemp(prefix="kw-mig2-pg-")
-    server = pgserver.get_server(data_dir)
-    socket_dir = server.get_uri().split("host=")[1]
-    base = f"postgresql+asyncpg://postgres@/postgres?host={socket_dir}"
-    try:
-        name = f"mig2_{uuid_mod.uuid4().hex[:12]}"
-        admin = create_async_engine(base, isolation_level="AUTOCOMMIT")
-        from sqlalchemy import text as sa_text
+    def _run(action):
+        def step(sync_connection):
+            config = alembic_config(url, branches)
+            config.attributes["connection"] = sync_connection
+            action(config)
+        return step
 
-        async with admin.connect() as connection:
-            await connection.execute(sa_text(f'CREATE DATABASE "{name}"'))
-        url = base.replace("/postgres?", f"/{name}?")
-        branches = Branches(locations=(MEMORY_MIGRATIONS,),
-                            model_modules=("acme.kw_enterprise.memory.models",))
-
-        def _run(action):
-            def step(sync_connection):
-                config = alembic_config(url, branches)
-                config.attributes["connection"] = sync_connection
-                action(config)
-            return step
-
-        engine = create_async_engine(url)
-        async with engine.begin() as connection:
-            await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0001")))
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-        async with maker() as session, session.begin():  # 存量：排队标记已写、衰减水位列尚不存在
-            # 都用裸 SQL：此时主线停在 0039（acme_0001 的依赖），0039 年代的 user 表与
-            # v0.0.6 ORM（0045 后）列不一致；升到 heads 时迁移自己演化这行数据
-            await session.execute(text(
-                "INSERT INTO \"user\" (id, email, name, status) "
-                "VALUES ('u9', 'u9@example.com', '用户九', 'active')"))
-            await session.execute(text(
-                "INSERT INTO memory_setting (user_id, enabled, last_organized_at) "
-                "VALUES ('u9', true, '2026-11-01T00:00:00Z')"))
-        async with engine.begin() as connection:
-            await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0002")))
-        async with maker() as session:
-            value = (await session.execute(
-                text("SELECT last_decayed_at FROM memory_setting WHERE user_id='u9'"))).scalar_one()
-            assert value == datetime(2026, 11, 1, tzinfo=UTC)  # 回填 ✓
-        await engine.dispose()
-        await _drop_database(base, name)
-    finally:
-        server.cleanup()
-        shutil.rmtree(data_dir, ignore_errors=True)
+    engine = create_async_engine(url)
+    async with engine.begin() as connection:
+        await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0001")))
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session, session.begin():  # 存量：排队标记已写、衰减水位列尚不存在
+        # 都用裸 SQL：此时主线停在 0039（acme_0001 的依赖），0039 年代的 user 表与
+        # v0.0.6 ORM（0045 后）列不一致；升到 heads 时迁移自己演化这行数据
+        await session.execute(text(
+            "INSERT INTO \"user\" (id, email, name, status) "
+            "VALUES ('u9', 'u9@example.com', '用户九', 'active'), "
+            "('u10', 'u10@example.com', '用户十', 'active')"))
+        await session.execute(text(
+            "INSERT INTO memory_setting (user_id, enabled, last_organized_at) "
+            "VALUES ('u9', true, '2026-11-01T00:00:00Z'), "
+            "('u10', true, '2026-11-01T00:00:00Z')"))
+        await session.execute(text(
+            "UPDATE memory_setting SET last_organized_at = NULL WHERE user_id = 'u10'"))
+    async with engine.begin() as connection:
+        await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0003")))
+    async with maker() as session:
+        u9 = (await session.execute(
+            text("SELECT last_decayed_at FROM memory_setting WHERE user_id='u9'"))).scalar_one()
+        u10 = (await session.execute(
+            text("SELECT last_decayed_at FROM memory_setting WHERE user_id='u10'"))).scalar_one()
+    assert u9 == datetime(2026, 11, 1, tzinfo=UTC)  # 回填 ✓
+    assert u10 is None  # 无衰减历史的行保持 NULL，不虚构水位
+    await engine.dispose()
+    await _drop_database(pg_url, name)
