@@ -616,9 +616,9 @@ class MemoryService:
             row.type = kind
             row.embedding = None
             row.embedding_model = None
-            if kind == TASK:
-                row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
-            else:
+            if kind == TASK and row.expires_at is None:
+                row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)  # 只补空缺：task→task 保留用户期限
+            elif kind != TASK:
                 row.expires_at = None
             row.mention_count += 1
             row.last_mentioned_at = _now()

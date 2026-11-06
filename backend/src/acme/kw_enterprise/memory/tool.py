@@ -82,6 +82,9 @@ class RememberTool:
                 return f"已记住（更新了原来的说法）：{content}。可在 设置 → 我的记忆 中管理。"
 
         alias, vector = await self._embed(ctx.workspace_id, content)
+        if vector is not None:
+            # embed 有耗时：向量判重前重取池，别用旧快照漏掉 embed 期间新写入的行（R3 审查 C）
+            pool = await self._service.dedup_pool(ctx.user_id)
         for row in pool:
             if row["status"] == ACTIVE and row["embedding"] and vector and \
                     cosine(vector, row["embedding"]) >= SIMILAR_UPDATE_THRESHOLD:

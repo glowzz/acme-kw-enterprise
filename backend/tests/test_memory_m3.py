@@ -12,6 +12,7 @@ from knowwork_server.tools.registry import ToolFailure
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from acme.kw_enterprise.extension import MEMORY_MIGRATIONS
 from acme.kw_enterprise.memory import tool as memory_tool
 from acme.kw_enterprise.memory.models import (
     ACTIVE,
@@ -23,6 +24,7 @@ from acme.kw_enterprise.memory.models import (
     PREFERENCE,
     TASK,
     Memory,
+    MemorySetting,
 )
 from acme.kw_enterprise.memory.organize import organize_user
 from acme.kw_enterprise.memory.service import MemoryService
@@ -379,3 +381,98 @@ async def test_remember_rejects_channel_accounts(sessionmaker, service):
     with pytest.raises(ToolFailure, match="渠道"):
         await tool.handler(_Ctx(user_id="bot"), {"content": "回答用表格"})
     assert await available(_Ctx(user_id="bot")) is False
+
+
+# ---- M3-R3 审查意见的回归用例 ----
+
+
+async def test_provider_marker_does_not_block_decay(sessionmaker, service):
+    """R2 拆水位的初衷：提供者入队即写 last_organized_at（排队标记），衰减必须仍能触发——
+    混用两个语义会让自动链路的增量衰减常态为 0（120 天没提也不降权）。"""
+    from datetime import UTC, datetime, timedelta
+
+    row_id = await _seed(sessionmaker, "u1", status=ACTIVE, source=EXTRACTED, type=FACT,
+                         content="120 天没提的事实", score=0.5,
+                         last_mentioned_at=datetime.now(UTC) - timedelta(days=120))
+    async with sessionmaker() as session, session.begin():  # 模拟提供者的排队标记（今天）
+        session.add(MemorySetting(user_id="u1", enabled=True, last_organized_at=datetime.now(UTC)))
+    counts = await organize_user(service, None, "u1", "ws1")
+    async with sessionmaker() as session:
+        row = await session.get(Memory, row_id)
+        assert row is not None and row.score < 0.5  # 衰减真的发生了（0.5×0.85^4≈0.26）
+        setting = await session.get(MemorySetting, "u1")
+        assert setting is not None and setting.last_decayed_at is not None  # 衰减水位独立推进
+    assert counts["decayed_archived"] == 0
+
+
+async def test_remember_update_preserves_custom_task_expiry(sessionmaker, service):
+    """R3：task→task 保留用户改过的期限（只补空缺）；此前无条件重置会吞掉自定义期限。"""
+    from datetime import UTC, datetime, timedelta
+
+    custom = datetime.now(UTC) + timedelta(days=60)
+    task_id = await _seed(sessionmaker, "u1", status=ACTIVE, type=TASK, content="核对账目",
+                          expires_at=custom)
+    await service.remember_update("u1", task_id, "继续核对账目", TASK)
+    async with sessionmaker() as session:
+        row = await session.get(Memory, task_id)
+        assert row is not None and row.expires_at == custom  # 自定义期限保留
+
+
+async def test_migration_backfills_decay_watermark(pg_url):
+    """R3：升级到 acme_0002 时，旧的排队标记回填成衰减水位——存量行不被重新衰减。"""
+    import shutil
+    import tempfile
+    import uuid as uuid_mod
+
+    import pgserver
+    from alembic import command
+    from knowwork_server.db.migrate import Branches, alembic_config
+    from sqlalchemy import text
+
+
+    data_dir = tempfile.mkdtemp(prefix="kw-mig2-pg-")
+    server = pgserver.get_server(data_dir)
+    socket_dir = server.get_uri().split("host=")[1]
+    base = f"postgresql+asyncpg://postgres@/postgres?host={socket_dir}"
+    try:
+        name = f"mig2_{uuid_mod.uuid4().hex[:12]}"
+        admin = create_async_engine(base, isolation_level="AUTOCOMMIT")
+        from sqlalchemy import text as sa_text
+
+        async with admin.connect() as connection:
+            await connection.execute(sa_text(f'CREATE DATABASE "{name}"'))
+        url = base.replace("/postgres?", f"/{name}?")
+        branches = Branches(locations=(MEMORY_MIGRATIONS,),
+                            model_modules=("acme.kw_enterprise.memory.models",))
+
+        def _run(action):
+            def step(sync_connection):
+                config = alembic_config(url, branches)
+                config.attributes["connection"] = sync_connection
+                action(config)
+            return step
+
+        engine = create_async_engine(url)
+        async with engine.begin() as connection:
+            await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0001")))
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with maker() as session, session.begin():  # 存量：排队标记已写、衰减水位列尚不存在
+            # 都用裸 SQL：此时主线停在 0039（acme_0001 的依赖），0039 年代的 user 表与
+            # v0.0.6 ORM（0045 后）列不一致；升到 heads 时迁移自己演化这行数据
+            await session.execute(text(
+                "INSERT INTO \"user\" (id, email, name, status) "
+                "VALUES ('u9', 'u9@example.com', '用户九', 'active')"))
+            await session.execute(text(
+                "INSERT INTO memory_setting (user_id, enabled, last_organized_at) "
+                "VALUES ('u9', true, '2026-11-01T00:00:00Z')"))
+        async with engine.begin() as connection:
+            await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0002")))
+        async with maker() as session:
+            value = (await session.execute(
+                text("SELECT last_decayed_at FROM memory_setting WHERE user_id='u9'"))).scalar_one()
+            assert value == datetime(2026, 11, 1, tzinfo=UTC)  # 回填 ✓
+        await engine.dispose()
+        await _drop_database(base, name)
+    finally:
+        server.cleanup()
+        shutil.rmtree(data_dir, ignore_errors=True)
