@@ -247,7 +247,7 @@ class MemoryService:
 
         入队前过三道闸：本人得是这个空间的成员（写它的 job 表）、个人开关开着、空间开关开着——
         判权在服务层（workspace:use 即成员，owner/admin/editor 都含），判不了宁可 403。"""
-        if self._access is None or not await self._access.check(user_id, workspace_id, "workspace", "use"):
+        if self._access is None or not self._access.check(user_id, workspace_id, "workspace", "use"):
             raise Denied("只有本空间成员可以整理自己的记忆")
         if not (await self.setting(user_id))["enabled"]:
             raise Conflict("个人记忆已关闭，先在设置里打开再整理")
@@ -296,7 +296,7 @@ class MemoryService:
     async def workspace_setting(self, actor_id: str, workspace_id: str) -> dict[str, Any]:
         """空间开关的读取：成员可读（页面提示「本空间已停用」用），非成员 403——
         不给外人探测任意空间开关状态的口子。"""
-        if self._access is None or not await self._access.check(actor_id, workspace_id, "workspace", "use"):
+        if self._access is None or not self._access.check(actor_id, workspace_id, "workspace", "use"):
             raise Denied("只有本空间成员可以查看本空间的记忆开关")
         return await self.workspace_disabled(workspace_id)
 
@@ -311,7 +311,7 @@ class MemoryService:
         """空间管理员停用/启用本空间的记忆。管理员判定在服务层（workspace:edit，owner/admin 过——
         上游默认权限表 rules.py _DEFAULTS：ADMIN 给 workspace:edit、EDITOR 只有 workspace:use，
         成员停不掉整个空间的记忆），判不了宁可 403 不放过。"""
-        if self._access is None or not await self._access.check(actor_id, workspace_id, "workspace", "edit"):
+        if self._access is None or not self._access.check(actor_id, workspace_id, "workspace", "edit"):
             raise Denied("只有空间管理员可以停用本空间的记忆")
         async with self._sessionmaker() as session, session.begin():
             statement = pg_insert(MemoryWorkspaceSetting).values(

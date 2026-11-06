@@ -55,7 +55,7 @@ class FakeModels:
 
 
 class FakeAccess:
-    async def check(self, user_id: str, workspace_id: str, resource: str, action: str) -> bool:
+    def check(self, user_id: str, workspace_id: str, resource: str, action: str) -> bool:
         return True
 
 

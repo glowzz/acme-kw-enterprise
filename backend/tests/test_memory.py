@@ -105,7 +105,7 @@ class FakeAccess:
         self.allowed = allowed
         self.calls: list[tuple[str, str, str, str]] = []
 
-    async def check(self, user_id: str, workspace_id: str, resource: str, action: str) -> bool:
+    def check(self, user_id: str, workspace_id: str, resource: str, action: str) -> bool:
         self.calls.append((user_id, workspace_id, resource, action))
         return self.allowed
 
