@@ -54,6 +54,7 @@ async def organize_user(service: MemoryService, models: ModelClient | None,
 
     counts: dict[str, Any] = {}
     counts["expired"] = await service.archive_expired(user_id)
+    last_organized_at = (await service.setting(user_id))["lastOrganizedAt"]
 
     pairs = await service.merge_candidates(user_id)
     merges: list[dict[str, Any]] = []
@@ -74,16 +75,18 @@ async def organize_user(service: MemoryService, models: ModelClient | None,
                                     response_format=MERGE_SCHEMA, max_tokens=1024, background=True)
             for decision in _parse_merges(raw):
                 pair = next((p for p in pairs if p["_slot"] == decision["pair"]), None)
-                if pair is None or decision["action"] != "merge" or not decision.get("content"):
+                content = (decision.get("content") or "").strip()
+                if pair is None or decision["action"] != "merge":
                     continue
-                merges.append({"keep_id": pair["a_id"], "drop_id": pair["b_id"],
-                               "content": decision["content"][:500]})
+                if not 1 <= len(content) <= 500:
+                    continue  # 空白/超长的合并表述跳过，别让 _content_of 炸整批（R2 前的 P3）
+                merges.append({"keep_id": pair["a_id"], "drop_id": pair["b_id"], "content": content})
         except ModelCallError as error:
             log.warning("memory organize: merge judge failed (%s); pairs kept as-is", error.code)
     counts["merged"] = await service.apply_merges(user_id, merges) if merges else 0
     counts["pairs"] = len(pairs)
 
-    counts["decayed_archived"] = await service.decay_scores(user_id)
+    counts["decayed_archived"] = await service.decay_scores(user_id, last_organized_at)
     counts["trimmed"] = await service.trim_active(user_id)
 
     embed_alias = await resolve_model(models, workspace_id, Capability.EMBEDDING, EMBED_MODEL_ENV) \
@@ -100,7 +103,8 @@ async def organize_user(service: MemoryService, models: ModelClient | None,
                 log.warning("memory organize: revector failed (%s); lazy retry next day", error.code)
                 break
             await service.store_vectors(user_id, embed_alias,
-                                        [{"id": item["id"], "embedding": vector}
+                                        [{"id": item["id"], "content": item["content"],
+                                          "embedding": vector}
                                          for item, vector in zip(batch, vectors, strict=True)])
             counts["revectored"] += len(batch)
 

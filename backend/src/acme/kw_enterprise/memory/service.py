@@ -132,6 +132,7 @@ class MemoryService:
         if expires_at is not None and expires_at.tzinfo is None:
             raise Invalid("期限要带时区（例如 2026-12-01T00:00:00Z）")
         async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)  # 改内容与整理的补向量互斥（同 remember_update）
             row = await _owned(session, user_id, memory_id)
             if content is not None:
                 row.content = _content_of(content)
@@ -499,9 +500,11 @@ class MemoryService:
                 applied += 1
             return applied
 
-    async def decay_scores(self, user_id: str) -> int:
+    async def decay_scores(self, user_id: str, last_organized_at: datetime | None = None) -> int:
         """步骤 3 降权：fact/focus 且 extracted 的，按整月 gap 每月 ×0.85；score <0.15 → archived。
-        preference 稳定不衰减、task 靠期限、手动/工具行不参与。"""
+        preference 稳定不衰减、task 靠期限、手动/工具行不参与。
+        衰减是**增量**的（R2 修正）：只应用「上次整理之后」新累积的整月数——score 是上次衰减后
+        的值，若每次都对全量 gap 再乘一遍，每天一次的整理会在两周内清空所有一个月没被提及的行。"""
         async with self._sessionmaker() as session, session.begin():
             await _acquire_capacity_lock(session, user_id)
             rows = await session.scalars(select(Memory).where(
@@ -510,10 +513,14 @@ class MemoryService:
             archived = 0
             for row in rows:
                 anchor = row.last_mentioned_at or row.created_at
-                gap_months = max(0, ( (_now() - anchor).days // 30 ))
-                if gap_months <= 0:
+                total_months = (_now() - anchor).days // 30
+                applied_months = 0
+                if last_organized_at is not None:
+                    applied_months = max(0, (last_organized_at - anchor).days // 30)
+                incremental = max(0, total_months - applied_months)
+                if incremental <= 0:
                     continue
-                row.score = row.score * (DECAY_FACTOR ** gap_months)
+                row.score = row.score * (DECAY_FACTOR ** incremental)
                 if row.score < ARCHIVE_BELOW:
                     row.status = ARCHIVED
                     archived += 1
@@ -541,7 +548,9 @@ class MemoryService:
 
     async def stale_vector_rows(self, user_id: str, alias: str, *,
                                 limit: int = 96) -> list[dict[str, Any]]:
-        """步骤 5 的补算清单：向量缺失或嵌入模型换了（维度/口径都不齐）的行，全部状态都补。"""
+        """步骤 5 的补算清单：向量缺失或嵌入模型换了（维度/口径都不齐）的行，全部状态都补。
+        带上 content：回写时校验行内容没变（清单读在锁外，期间被改写的行跳过，
+        R2 前的 P1 修正——旧向量覆写新内容行且别名相同、永不自愈）。"""
         async with self._sessionmaker() as session:
             rows = await session.scalars(select(Memory).where(
                 Memory.user_id == user_id,
@@ -550,34 +559,43 @@ class MemoryService:
 
     async def store_vectors(self, user_id: str, alias: str,
                             items: Sequence[dict[str, Any]]) -> int:
-        """步骤 5 落库：{id, embedding} 列表回写（拿锁，与 remember_update 互斥）。"""
+        """步骤 5 落库：{id, embedding} 列表回写（拿锁，与 remember_update/edit 互斥）；
+        行内容与取清单时不一致的跳过——旧向量不覆写新内容。"""
         async with self._sessionmaker() as session, session.begin():
             await _acquire_capacity_lock(session, user_id)
+            stored = 0
             for item in items:
                 row = await session.get(Memory, item["id"])
-                if row is not None and row.user_id == user_id:
-                    row.embedding = item["embedding"]
-                    row.embedding_model = alias
-            return len(items)
+                if row is None or row.user_id != user_id or row.content != item["content"]:
+                    continue
+                row.embedding = item["embedding"]
+                row.embedding_model = alias
+                stored += 1
+            return stored
 
     # ---- M3：「记住」工具的原语 ----
 
     async def remember_insert(self, user_id: str, workspace_id: str, content: str, kind: str,
-                              embedding: list[float] | None = None) -> dict[str, Any]:
-        """工具写入：用户亲口说的，直接生效、source=tool；满额明确报错（工具能向用户解释）。"""
+                              embedding: list[float] | None = None,
+                              embedding_model: str | None = None) -> dict[str, Any]:
+        """工具写入：用户亲口说的，直接生效、source=tool；满额明确报错（工具能向用户解释）。
+        embedding 与它的模型别名必须成对写——只写向量不写别名，stale_vector_rows 的
+        「别名不一致」条件永远不命中，这行永远进不了补算清单（R2 前的 P2）。"""
         content = _content_of(content)
         async with self._sessionmaker() as session, session.begin():
             await _require_capacity(session, user_id)
             row = Memory(id=f"mem_{uuid.uuid4().hex}", user_id=user_id, type=kind, content=content,
                          source=BY_TOOL, status=ACTIVE, score=1.0,
                          origin_workspace_id=workspace_id, embedding=embedding,
+                         embedding_model=embedding_model,
                          expires_at=_now() + timedelta(days=TASK_TTL_DAYS) if kind == TASK else None)
             session.add(row)
             view = _view(row)
         return view
 
     async def remember_update(self, user_id: str, memory_id: str, content: str, kind: str) -> dict[str, Any]:
-        """工具改写近重复的旧说法：内容/类型按用户新表述，向量作废待整理补算，记账 +1。"""
+        """工具改写近重复的旧说法：内容/类型按用户新表述，向量作废待整理补算，记账 +1。
+        期限归属跟最终类型走（与 edit 同一不变式：task 补默认期限，非 task 摘掉）。"""
         content = _content_of(content)
         async with self._sessionmaker() as session, session.begin():
             await _acquire_capacity_lock(session, user_id)  # 与整理的补向量互斥：防旧向量覆写新内容行
@@ -588,6 +606,10 @@ class MemoryService:
             row.type = kind
             row.embedding = None
             row.embedding_model = None
+            if kind == TASK:
+                row.expires_at = _now() + timedelta(days=TASK_TTL_DAYS)
+            else:
+                row.expires_at = None
             row.mention_count += 1
             row.last_mentioned_at = _now()
             view = _view(row)

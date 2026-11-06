@@ -12,6 +12,7 @@ from knowwork_server.tools.registry import ToolFailure
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from acme.kw_enterprise.memory import tool as memory_tool
 from acme.kw_enterprise.memory.models import (
     ACTIVE,
     ACTIVE_CAP,
@@ -284,3 +285,97 @@ async def test_organize_skips_when_disabled(sessionmaker, service):
     await service.set_setting("u1", False)
     counts = await organize_user(service, None, "u1", "ws1")
     assert counts == {"skipped": "personal_disabled"}
+
+
+# ---- M3-R1 审查意见的回归用例 ----
+
+
+class FakeProfiles:
+    def __init__(self, kinds: dict[str, str] | None = None) -> None:
+        self.kinds = kinds or {}
+
+    async def __call__(self, user_ids):
+        return {uid: type("P", (), {"kind": self.kinds.get(uid, "person")})() for uid in user_ids}
+
+
+async def test_decay_is_incremental_not_reapplied(sessionmaker, service):
+    """P1：衰减按增量——连跑两次整理，第二次不再对全量 gap 重复乘（否则两周清空 stale 行）。"""
+    from datetime import timedelta
+
+    row_id = await _seed(sessionmaker, "u1", status=ACTIVE, source=EXTRACTED, type=FACT,
+                         content="两个月没提的事实", score=1.0,
+                         last_mentioned_at=datetime.now(UTC) - timedelta(days=65))
+    await organize_user(service, None, "u1", "ws1")  # 首次：全量 gap（65d//30=2）
+    async with sessionmaker() as session:
+        score_after_first = (await session.get(Memory, row_id)).score
+    assert score_after_first == pytest.approx(1.0 * 0.85 ** 2)
+    # 第二次整理：last_organized_at 刚写，增量月数为 0
+    second = await organize_user(service, None, "u1", "ws1")
+    async with sessionmaker() as session:
+        score_after_second = (await session.get(Memory, row_id)).score
+    assert score_after_second == score_after_first  # 不再衰减
+    assert second["decayed_archived"] == 0
+
+
+async def test_store_vectors_skips_rewritten_rows(sessionmaker, service):
+    """P1：清单读在锁外，期间被改写的行不能被旧向量覆写（且别名相同永不自愈）。"""
+    row_id = await _seed(sessionmaker, "u1", status=ACTIVE, content="原内容 aaaa")
+    stale = await service.stale_vector_rows("u1", "embedding-alias")
+    assert [item["id"] for item in stale] == [row_id]
+    await service.edit("u1", row_id, content="改写后的新内容")  # 清单读取与回写之间被改写
+    stored = await service.store_vectors("u1", "embedding-alias",
+                                         [{"id": item["id"], "content": item["content"],
+                                           "embedding": [1.0, 0.0, 0.0, 0.0]} for item in stale])
+    assert stored == 0
+    async with sessionmaker() as session:
+        row = await session.get(Memory, row_id)
+        assert row is not None and row.embedding is None  # 新内容行不被旧向量污染
+
+
+async def test_remember_insert_pairs_embedding_with_model(sessionmaker, service):
+    """P2：向量与别名成对写——否则 stale_vector_rows 的「别名不一致」永远不命中，行永不补算。"""
+    await service.remember_insert("u1", "ws1", "回答用表格", PREFERENCE,
+                                  embedding=[1.0, 0.0, 0.0, 0.0], embedding_model="embedding-alias")
+    stale = await service.stale_vector_rows("u1", "embedding-alias")
+    assert stale == []  # 别名一致：不在补算清单
+    stale_after_switch = await service.stale_vector_rows("u1", "new-embed-alias")
+    assert len(stale_after_switch) == 1  # 换了模型：进补算清单
+
+
+async def test_remember_update_maintains_expiry_invariant(sessionmaker, service):
+    """P2：工具改类型的期限不变式与 edit 一致——task 补默认期限，非 task 摘掉。"""
+
+    tool, _ = memory_tool.build_remember_tool(service, None)
+    fact_id = await _seed(sessionmaker, "u1", status=ACTIVE, type=FACT, content="一条事实")
+    task_view = await tool.handle(_Ctx(), {"id": fact_id}) if False else \
+        await service.remember_update("u1", fact_id, "改成在办事项", TASK)
+    assert task_view["expiresAt"] is not None  # 转成 task：补默认期限
+    back = await service.remember_update("u1", fact_id, "改回事实", FACT)
+    assert back["expiresAt"] is None  # 改回非 task：摘期限
+
+
+async def test_organize_skips_blank_merge_content(sessionmaker, service):
+    """P3：模型给出全空白的合并表述 → 跳过该对，不炸整批。"""
+    import json as jsonlib
+
+    a = await _seed(sessionmaker, "u1", status=ACTIVE, source=EXTRACTED,
+                    content="用户每周一开例会", embedding=[6.0, 0.0, 0.0, 0.0])
+    b = await _seed(sessionmaker, "u1", status=ACTIVE, source=EXTRACTED,
+                    content="用户例会在每周一", embedding=[6.0, 0.0, 0.0, 0.0])
+
+    class _BlankMerge(FakeModels):
+        async def chat(self, workspace_id, alias, messages, **kwargs):
+            return jsonlib.dumps({"decisions": [{"pair": 0, "action": "merge", "content": "   "}]})
+
+    counts = await organize_user(service, _BlankMerge(), "u1", "ws1")
+    assert counts["pairs"] == 1 and counts["merged"] == 0  # 跳过而非抛错
+    statuses = {item["id"]: item["status"] for item in await service.export("u1")}
+    assert statuses[a] == "active" and statuses[b] == "active"  # 两行原样保留
+
+
+async def test_remember_rejects_channel_accounts(sessionmaker, service):
+    """P3：渠道账号没有「本人」，工具入口显式拒绝（设计 §6/§10）。"""
+    tool, available = memory_tool.build_remember_tool(service, None, FakeProfiles({"bot": "channel"}))
+    with pytest.raises(ToolFailure, match="渠道"):
+        await tool.handler(_Ctx(user_id="bot"), {"content": "回答用表格"})
+    assert await available(_Ctx(user_id="bot")) is False

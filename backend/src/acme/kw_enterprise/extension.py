@@ -41,7 +41,7 @@ class Enterprise:
         context = MemoryContext(service, ctx.models, ctx.profiles)
         ctx.turn_context.add(context.provider)  # v0.0.6：多提供者按登记顺序拼，出错整轮不带
         ctx.on_turn_ended("memory", memory_extract.build_contributor(service, ctx.profiles))
-        remember, available = memory_tool.build_remember_tool(service, ctx.models)
+        remember, available = memory_tool.build_remember_tool(service, ctx.models, ctx.profiles)
         ctx.tools.add(ProvidedTool(tool=remember, available=available))
         return [workspaces_api.build_router(ctx),
                 skills_api.build_router(ctx),
