@@ -15,7 +15,7 @@ frontend/   TS 入口（导出 install(register)），web 构建时经 KNOWWORK_
 ## 开发（对照设计文档 10.3）
 
 ```sh
-# KnowWork-stable 是钉在 v0.0.4 的 git worktree，扩展联调都在它里面跑
+# KnowWork-stable 是钉在 v0.0.6 的 git worktree，扩展联调都在它里面跑
 cd ../KnowWork-stable/server
 uv pip install -e ../../acme-kw-enterprise/backend          # 后端：入口点即注册；改 pyproject 后要重跑
 

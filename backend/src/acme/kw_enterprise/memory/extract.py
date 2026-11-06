@@ -203,7 +203,7 @@ async def extract_from_turn(service: MemoryService, models: ModelClient, user_id
                                          [candidate["content"] for candidate in kept],
                                          background=True)
         except ModelCallError as error:
-            log.warning("memory extract: embed failed; candidates keep no vectors (%s)",
+            log.warning("memory extract: embed failed; candidates keep no vectors (%s) — 落库按置信走",
                         error.code)  # 设计 §5：向量失败留空，不影响按置信落库
         else:
             if len(vectors) != len(kept):
@@ -309,16 +309,16 @@ def _parse_decisions(raw: str) -> list[dict[str, Any]]:
 
 
 def build_extract_handler(service: MemoryService, models: ModelClient):
-    """worker 的 memory.extract handler：守卫与守卫间的差异都收敛到 extract_from_turn。"""
+    """worker 的 memory.extract handler：守卫与守卫间的差异都收敛到 extract_from_turn。
+    返回 None——落库在 extract_from_turn 里已完成，不需要 Done 的同事务回写。"""
 
-    async def handle(job_ctx: JobContext) -> dict[str, int] | None:
+    async def handle(job_ctx: JobContext) -> None:
         payload = job_ctx.payload
         result = await extract_from_turn(service, models, payload["user_id"], job_ctx.workspace_id,
                                          payload.get("question", ""), payload.get("answer", ""))
         if result:
             log.info("memory extract for %s turn %s: %s", payload.get("conversation_id"),
                      payload.get("turn"), result)
-        return result
 
     return handle
 
