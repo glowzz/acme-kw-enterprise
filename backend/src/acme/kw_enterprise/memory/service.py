@@ -550,8 +550,9 @@ class MemoryService:
 
     async def store_vectors(self, user_id: str, alias: str,
                             items: Sequence[dict[str, Any]]) -> int:
-        """步骤 5 落库：{id, embedding} 列表回写。"""
+        """步骤 5 落库：{id, embedding} 列表回写（拿锁，与 remember_update 互斥）。"""
         async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)
             for item in items:
                 row = await session.get(Memory, item["id"])
                 if row is not None and row.user_id == user_id:
@@ -579,6 +580,7 @@ class MemoryService:
         """工具改写近重复的旧说法：内容/类型按用户新表述，向量作废待整理补算，记账 +1。"""
         content = _content_of(content)
         async with self._sessionmaker() as session, session.begin():
+            await _acquire_capacity_lock(session, user_id)  # 与整理的补向量互斥：防旧向量覆写新内容行
             row = await _owned(session, user_id, memory_id)
             if row.status != ACTIVE:
                 raise Conflict("只有生效中的记忆可以更新")
