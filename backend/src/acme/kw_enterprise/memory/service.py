@@ -16,6 +16,7 @@ from knowwork_server.jobs.queue import enqueue
 from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.orm import load_only
 
 from .dedup import cosine
 from .jobs import EXTRACT, ORGANIZE
@@ -342,8 +343,12 @@ class MemoryService:
         with_embeddings=False 给只做签名判重的调用方（remember 的首次取池）：省 200 行
         JSONB 向量的传输，向量留给 embed 之后的重取那一次。"""
         async with self._sessionmaker() as session:
-            rows = await session.scalars(select(Memory).where(
-                Memory.user_id == user_id, Memory.status.in_((ACTIVE, PENDING))))
+            query = select(Memory).where(
+                Memory.user_id == user_id, Memory.status.in_((ACTIVE, PENDING)))
+            if not with_embeddings:
+                query = query.options(load_only(Memory.id, Memory.content, Memory.status,
+                                                Memory.source))  # 真省掉 200 行 JSONB 的传输与反序列化
+            rows = await session.scalars(query)
             return [{"id": row.id, "content": row.content, "status": row.status,
                      "source": row.source,
                      "embedding": row.embedding if with_embeddings else None} for row in rows]

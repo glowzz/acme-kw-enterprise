@@ -81,16 +81,16 @@ class RememberTool:
                 return f"已记住（更新了原来的说法）：{content}。可在 设置 → 我的记忆 中管理。"
 
         alias, vector = await self._embed(ctx.workspace_id, content)
-        if vector is not None:
-            # embed 有耗时：向量判重前重取池（这次带向量），并对 embed 期间新写入的行补一次签名判重
-            pool = await self._service.dedup_pool(ctx.user_id)
-            for row in pool:
-                if row["status"] == ACTIVE and signature(row["content"]) == signature(content):
-                    try:
-                        await self._service.remember_update(ctx.user_id, row["id"], content, kind)
-                    except MemoryError as error:
-                        raise ToolFailure(str(error)) from error
-                    return f"已记住（更新了原来的说法）：{content}。可在 设置 → 我的记忆 中管理。"
+        # embed 有耗时：重取池，对 embed 期间新写入的行补一次签名判重——embed 失败也要做
+        # （否则失败路径用旧快照，同行内容重复落库）
+        pool = await self._service.dedup_pool(ctx.user_id)
+        for row in pool:
+            if row["status"] == ACTIVE and signature(row["content"]) == signature(content):
+                try:
+                    await self._service.remember_update(ctx.user_id, row["id"], content, kind)
+                except MemoryError as error:
+                    raise ToolFailure(str(error)) from error
+                return f"已记住（更新了原来的说法）：{content}。可在 设置 → 我的记忆 中管理。"
         for row in pool:
             if row["status"] == ACTIVE and row["embedding"] and vector and \
                     cosine(vector, row["embedding"]) >= SIMILAR_UPDATE_THRESHOLD:

@@ -349,11 +349,21 @@ async def test_remember_update_maintains_expiry_invariant(sessionmaker, service)
 
     tool, _ = memory_tool.build_remember_tool(service, None)
     fact_id = await _seed(sessionmaker, "u1", status=ACTIVE, type=FACT, content="一条事实")
-    task_view = await tool.handle(_Ctx(), {"id": fact_id}) if False else \
-        await service.remember_update("u1", fact_id, "改成在办事项", TASK)
+    task_view = await service.remember_update("u1", fact_id, "改成在办事项", TASK)
     assert task_view["expiresAt"] is not None  # 转成 task：补默认期限
     back = await service.remember_update("u1", fact_id, "改回事实", FACT)
     assert back["expiresAt"] is None  # 改回非 task：摘期限
+    # 已过期的期限：工具重述在办事项=还在办 → 续一个默认窗口（与 restore 同口径）
+    expired_id = await _seed(sessionmaker, "u1", status=ACTIVE, type=TASK, content="过期在办",
+                             expires_at=datetime.now(UTC) - timedelta(days=2))
+    renewed = await service.remember_update("u1", expired_id, "还在办这件事", TASK)
+    assert renewed["expiresAt"] is not None and renewed["expiresAt"] > datetime.now(UTC)
+    # task→task 保留用户改过的期限（不重置回 30 天默认）
+    custom = datetime.now(UTC) + timedelta(days=60)
+    custom_id = await _seed(sessionmaker, "u1", status=ACTIVE, type=TASK, content="核对账目",
+                            expires_at=custom)
+    kept = await service.remember_update("u1", custom_id, "继续核对账目", TASK)
+    assert kept["expiresAt"] == custom
 
 
 async def test_organize_skips_blank_merge_content(sessionmaker, service):
@@ -399,7 +409,9 @@ async def test_provider_marker_does_not_block_decay(sessionmaker, service):
     counts = await organize_user(service, None, "u1", "ws1")
     async with sessionmaker() as session:
         row = await session.get(Memory, row_id)
-        assert row is not None and row.score < 0.5  # 衰减真的发生了（0.5×0.85^4≈0.26）
+        assert row is not None
+        assert row.score == pytest.approx(0.5 * 0.85 ** 4)  # 精确衰减量（120d//30=4 个月）
+        assert row.score < 0.5
         setting = await session.get(MemorySetting, "u1")
         assert setting is not None and setting.last_decayed_at is not None  # 衰减水位独立推进
     assert counts["decayed_archived"] == 0
@@ -445,9 +457,10 @@ async def test_migration_backfills_decay_watermark(pg_url):
 
     engine = create_async_engine(url)
     async with engine.begin() as connection:
-        await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0001")))
+        # 先升到 acme_0002（加列、无回填）：精确复现「R2 构建已 stamp」的环境
+        await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0002")))
     maker = async_sessionmaker(engine, expire_on_commit=False)
-    async with maker() as session, session.begin():  # 存量：排队标记已写、衰减水位列尚不存在
+    async with maker() as session, session.begin():  # 存量：排队标记已写、衰减水位全 NULL
         # 都用裸 SQL：此时主线停在 0039（acme_0001 的依赖），0039 年代的 user 表与
         # v0.0.6 ORM（0045 后）列不一致；升到 heads 时迁移自己演化这行数据
         await session.execute(text(
@@ -461,6 +474,7 @@ async def test_migration_backfills_decay_watermark(pg_url):
         await session.execute(text(
             "UPDATE memory_setting SET last_organized_at = NULL WHERE user_id = 'u10'"))
     async with engine.begin() as connection:
+        # 单独升 acme_0003：证明已 stamp 的 acme_0002 拿不到原地追加的语句，回填必须在新 revision
         await connection.run_sync(_run(lambda c: command.upgrade(c, "acme_0003")))
     async with maker() as session:
         u9 = (await session.execute(
