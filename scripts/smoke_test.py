@@ -1,16 +1,21 @@
-"""一期功能的验收冒烟（对真实运行环境发 HTTP，覆盖设计文档第 5 节的验收清单）。
+"""扩展包功能的验收冒烟（对真实运行环境发 HTTP，覆盖设计文档的验收清单）。
 
-用法：python3 smoke_test.py <base_url> <email> <password>
+用法：python3 smoke_test.py [--token TOKEN] [base_url] [email] [password]
     base_url  默认 http://127.0.0.1:8100
-环境不被破坏的保证：只新建「smoke-」前缀的空间/技能，收尾全部删除或关闭。
+    --token   直接用现成会话 Cookie（kw_session 值），跳过登录——联调环境用后门造会话时方便
+环境不被破坏的保证：只新建「smoke-」前缀的空间/技能；记忆段自添加自删除、
+开关做完恢复原状、不调清空（clear 会删掉本人真实记忆）。
 
 链路：
- 1. 登录（Cookie 会话）
+ 1. 登录（Cookie 会话；--token 跳过）
  2. 空间管理：列表 → 新建 smoke-ws → 列表可见 → 改名 → （收尾）关闭
  3. 企业技能：上传 ZIP → 列表可见 → 发布 → 发放 [smoke-ws, default] → 详情/版本 → （收尾）删除
  4. 权限：未登录访问 → 401（隐含于每步 Cookie）
+ 5. 收尾清理
+ 6. 我的记忆：counts → 手动添加 → 列表/编辑/导出 → 删除 → 双开关（做完恢复） → 整理入队
 """
 
+import argparse
 import io
 import json
 import sys
@@ -19,8 +24,14 @@ import urllib.request
 import zipfile
 from typing import Any
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8100"
-EMAIL, PASSWORD = sys.argv[2], sys.argv[3]
+parser = argparse.ArgumentParser()
+parser.add_argument("base", nargs="?", default="http://127.0.0.1:8100")
+parser.add_argument("email", nargs="?")
+parser.add_argument("password", nargs="?")
+parser.add_argument("--token", default=None)
+args = parser.parse_args()
+BASE = args.base
+EMAIL, PASSWORD, TOKEN = args.email, args.password, args.token
 
 PASS, FAIL = 0, 0
 
@@ -60,14 +71,18 @@ def call(method: str, path: str, body: Any = None, raw: bytes | None = None,
 
 COOKIE = ""
 
-# ---- 1. 登录 ----
-req = urllib.request.Request(f"{BASE}/api/auth/login", method="POST",
-                             data=json.dumps({"email": EMAIL, "password": PASSWORD}).encode())
-req.add_header("Content-Type", "application/json")
-with urllib.request.urlopen(req) as resp:
-    set_cookie = resp.headers.get_all("Set-Cookie") or []
-    COOKIE = "; ".join(c.split(";")[0] for c in set_cookie)
-ok("1. 登录", bool(COOKIE), "没拿到 Cookie")
+# ---- 1. 登录（或用现成 token） ----
+if TOKEN:
+    COOKIE = f"kw_session={TOKEN}"
+    ok("1. 使用 --token 会话", True)
+else:
+    req = urllib.request.Request(f"{BASE}/api/auth/login", method="POST",
+                                 data=json.dumps({"email": EMAIL, "password": PASSWORD}).encode())
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req) as resp:
+        set_cookie = resp.headers.get_all("Set-Cookie") or []
+        COOKIE = "; ".join(c.split(";")[0] for c in set_cookie)
+    ok("1. 登录", bool(COOKIE), "没拿到 Cookie")
 
 # ---- 2. 空间管理 ----
 status, workspaces = call("GET", "/api/system/workspaces")
@@ -142,6 +157,66 @@ ok("5.2 关闭 smoke-ws", status == 204, f"status={status}")
 status, view = call("GET", "/api/system/workspaces")
 ids_after = {w.get("id") for w in (view or [])}
 ok("5.3 关闭后从列表消失", WS not in ids_after, f"ids={ids_after}")
+
+# ---- 6. 我的记忆（自清理：添加的删除，开关做完恢复；不调 clear——会删本人真实记忆） ----
+status, before_counts = call("GET", "/api/memory/counts")
+ok("6.1 counts", status == 200 and isinstance(before_counts, dict) and "cap" in before_counts,
+   f"status={status} body={before_counts}")
+
+status, added = call("POST", "/api/memory", {"type": "preference", "content": "冒烟：回答用表格"})
+ok("6.2 手动添加（201，直接生效）",
+   status == 201 and added.get("status") == "active" and added.get("source") == "user",
+   f"status={status} body={added}")
+MEM = added.get("id") if isinstance(added, dict) else None
+
+status, after_counts = call("GET", "/api/memory/counts")
+ok("6.3 counts.active +1",
+   isinstance(after_counts, dict) and after_counts.get("active") == (before_counts or {}).get("active", 0) + 1,
+   f"before={before_counts} after={after_counts}")
+
+status, listing = call("GET", "/api/memory?status=active&limit=50")
+ids = [item.get("id") for item in (listing or {}).get("items", [])]
+ok("6.4 列表含新记忆", MEM in ids, f"ids={ids[:5]}")
+
+status, edited = call("PATCH", f"/api/memory/{MEM}", {"content": "冒烟：回答改用表格"})
+ok("6.5 编辑", status == 200 and edited.get("content") == "冒烟：回答改用表格", f"status={status}")
+
+status, export = call("GET", "/api/memory/export")
+export_ids = [item.get("id") for item in (export or [])]
+ok("6.6 导出含该记忆（全字段可携带）", MEM in export_ids and all(
+    k in (export or [{}])[0] for k in ("type", "content", "source", "status")), f"status={status}")
+
+status, org = call("POST", "/api/memory/organize", {"workspaceId": "default"})
+ok("6.7 立即整理入队（202）", status == 202 and (org or {}).get("jobId"), f"status={status} body={org}")
+
+status, setting = call("GET", "/api/memory/settings")
+ok("6.8 开关读取（默认开启）", status == 200 and setting.get("enabled") is True, f"body={setting}")
+
+status, _ = call("PUT", "/api/memory/settings", {"enabled": False})
+status, setting_off = call("GET", "/api/memory/settings")
+ok("6.9 个人开关关闭", status == 200 and setting_off.get("enabled") is False, f"body={setting_off}")
+status, denied = call("POST", "/api/memory", {"type": "fact", "content": "关着不该能加"})
+ok("6.10 关闭后添加被拦（409）", status == 409, f"status={status} body={denied}")
+status, _ = call("PUT", "/api/memory/settings", {"enabled": True})  # 恢复原状
+status, setting_back = call("GET", "/api/memory/settings")
+ok("6.11 开关恢复开启", setting_back.get("enabled") is True, f"body={setting_back}")
+
+status, ws_setting = call("GET", "/api/workspaces/default/memory-setting")
+ok("6.12 空间开关读取（默认启用）", status == 200 and ws_setting.get("disabled") is False,
+   f"status={status} body={ws_setting}")
+status, _ = call("PUT", "/api/workspaces/default/memory-setting", {"disabled": True})
+status, ws_off = call("GET", "/api/workspaces/default/memory-setting")
+ok("6.13 空间管理员停用", ws_off.get("disabled") is True, f"body={ws_off}")
+status, _ = call("PUT", "/api/workspaces/default/memory-setting", {"disabled": False})  # 恢复
+status, ws_back = call("GET", "/api/workspaces/default/memory-setting")
+ok("6.14 空间开关恢复启用", ws_back.get("disabled") is False, f"body={ws_back}")
+
+status, _ = call("DELETE", f"/api/memory/{MEM}")
+ok("6.15 删除自添加的记忆（204）", status == 204, f"status={status}")
+status, final_counts = call("GET", "/api/memory/counts")
+ok("6.16 counts 恢复",
+   isinstance(final_counts, dict) and final_counts.get("active") == (before_counts or {}).get("active", 0),
+   f"before={before_counts} after={final_counts}")
 
 print(f"\n合计 {PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
