@@ -347,7 +347,6 @@ async def test_remember_insert_pairs_embedding_with_model(sessionmaker, service)
 async def test_remember_update_maintains_expiry_invariant(sessionmaker, service):
     """P2：工具改类型的期限不变式与 edit 一致——task 补默认期限，非 task 摘掉。"""
 
-    tool, _ = memory_tool.build_remember_tool(service, None)
     fact_id = await _seed(sessionmaker, "u1", status=ACTIVE, type=FACT, content="一条事实")
     task_view = await service.remember_update("u1", fact_id, "改成在办事项", TASK)
     assert task_view["expiresAt"] is not None  # 转成 task：补默认期限
@@ -442,8 +441,11 @@ async def test_migration_backfills_decay_watermark(pg_url):
 
     name = f"mig3_{uuid_mod.uuid4().hex[:12]}"
     admin = create_async_engine(pg_url, isolation_level="AUTOCOMMIT")
-    async with admin.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{name}"'))
+    try:
+        async with admin.connect() as connection:
+            await connection.execute(text(f'CREATE DATABASE "{name}"'))
+    finally:
+        await admin.dispose()
     url = pg_url.replace("/postgres?", f"/{name}?")
     branches = Branches(locations=(MEMORY_MIGRATIONS,),
                         model_modules=("acme.kw_enterprise.memory.models",))

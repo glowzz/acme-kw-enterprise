@@ -83,7 +83,7 @@ class RememberTool:
         alias, vector = await self._embed(ctx.workspace_id, content)
         # embed 有耗时：重取池，对 embed 期间新写入的行补一次签名判重——embed 失败也要做
         # （否则失败路径用旧快照，同行内容重复落库）
-        pool = await self._service.dedup_pool(ctx.user_id)
+        pool = await self._service.dedup_pool(ctx.user_id, with_embeddings=vector is not None)
         for row in pool:
             if row["status"] == ACTIVE and signature(row["content"]) == signature(content):
                 try:
