@@ -37,6 +37,24 @@ cd ../KnowWork-stable/server && uv run python ../../acme-kw-enterprise/scripts/d
 - 改 pyproject.toml（入口点）后必须重跑 `uv pip install -e`，改 .py/.tsx 文件不用（editable + vite 直生效）。
 - `frontend/node_modules` 不单独装：靠仓库根的软链指到 worktree web 的 node_modules（解析 react 等依赖）。
 
+## 部署（带扩展的镜像）
+
+上游镜像不含扩展。用 `scripts/build_ext_images.sh` 构建部署镜像：server 叠装扩展 wheel
+（授权随 wheel 里的 Verifier 自动生效，见设计文档事实 6——wheel 不要外发），gateway 构建时
+经 `KNOWWORK_WEB_EXTENSIONS` 注入扩展前端；runtime-host 不受扩展影响、重打标签即可：
+
+```sh
+scripts/build_ext_images.sh v0.0.6-mineru41 v0.0.6-mineru41-ext
+```
+
+之后在 KnowWork 的 `deploy/.env` 把 `KNOWWORK_VERSION` 换成扩展标签，`docker compose up -d`；
+api 启动时自动升级扩展的迁移分支（记忆三张表），不用手动建表。
+
+记忆模型不设环境变量时自动取空间模型目录里该能力的第一个；要钉死用
+`ACME_MEMORY_CHAT_MODEL` / `ACME_MEMORY_EMBED_MODEL`（worker 容器的环境变量，经
+`deploy/docker-compose.override.yml` 之类注入，不改上游编排文件）。只有对话模型时提取照常
+工作，向量召回与整理的 embed 步骤自动降级；要开语义召回在「模型」页配一个嵌入模型。
+
 ## 已实现（一期）
 
 | 功能 | 后端 | 前端 |
