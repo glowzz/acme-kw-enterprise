@@ -2,7 +2,7 @@
 # 构建带自研扩展的部署镜像：server 叠装 wheel、gateway 注入前端；runtime-host 不受扩展影响，
 # 把基础标签重打到扩展标签即可（compose 的 KNOWWORK_VERSION 统一引用三个镜像）。
 # 用法：scripts/build_ext_images.sh <基础镜像标签> <扩展镜像标签>
-#   例：scripts/build_ext_images.sh v0.0.6-mineru41 v0.0.6-mineru41-ext
+#   例：scripts/build_ext_images.sh v0.1.1-mineru41 v0.1.1-mineru41-ext
 # 前置：KnowWork 仓库在 ../KnowWork（或 KW_DIR 指定），其 server 侧镜像已按官方
 # Dockerfile 构建出基础标签；本机可访问镜像仓库（或已缓存所需基础镜像）。
 # 之后的切换：KnowWork deploy/.env 的 KNOWWORK_VERSION 换成扩展标签 → docker compose up -d；

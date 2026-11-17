@@ -44,7 +44,7 @@ cd ../KnowWork-stable/server && uv run python ../../acme-kw-enterprise/scripts/d
 经 `KNOWWORK_WEB_EXTENSIONS` 注入扩展前端；runtime-host 不受扩展影响、重打标签即可：
 
 ```sh
-scripts/build_ext_images.sh v0.0.6-mineru41 v0.0.6-mineru41-ext
+scripts/build_ext_images.sh v0.1.1-mineru41 v0.1.1-mineru41-ext
 ```
 
 之后在 KnowWork 的 `deploy/.env` 把 `KNOWWORK_VERSION` 换成扩展标签，`docker compose up -d`；
