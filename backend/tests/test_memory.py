@@ -21,7 +21,7 @@ from knowwork_server.identity.models import User
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from acme.kw_enterprise.extension import MEMORY_MIGRATIONS
+from acme.kw_enterprise.extension import MIGRATIONS
 from acme.kw_enterprise.memory.models import (
     ACTIVE,
     ACTIVE_CAP,
@@ -545,7 +545,8 @@ async def test_migration_branch_up_and_down(fresh_url):
     from alembic import command
     from knowwork_server.db.migrate import Branches, alembic_config
 
-    branches = Branches(locations=(MEMORY_MIGRATIONS,), model_modules=("acme.kw_enterprise.memory.models",))
+    branches = Branches(locations=(MIGRATIONS,), model_modules=("acme.kw_enterprise.memory.models",
+                                   "acme.kw_enterprise.quota.models",))
 
     def _run(action):
         def step(sync_connection):

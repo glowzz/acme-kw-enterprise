@@ -22,7 +22,8 @@ def test_license_and_extension_discovered() -> None:
 def test_contract_attributes() -> None:
     extension = installed_extensions().active[0]
     assert extension.license_module == "enterprise"
-    assert extension.model_modules == ("acme.kw_enterprise.memory.models",), "M1 起：记忆的三张全局表"
+    assert extension.model_modules == ("acme.kw_enterprise.memory.models",
+                                       "acme.kw_enterprise.quota.models"), "记忆三张 + 额度五张全局表"
     assert extension.rls_tables == (), "记忆跟着人走、跨空间，不进 RLS"
     assert extension.migrations is not None and extension.migrations.is_dir(), "记忆走自己的迁移分支"
 
@@ -35,6 +36,10 @@ class _Recorder:
         self.items: list = []
 
     def add(self, item) -> None:
+        self.items.append(item)
+
+    def set(self, item) -> None:
+        """quota.set 这类只许登记一个的挂接点。"""
         self.items.append(item)
 
     def __call__(self, *args) -> None:
@@ -60,6 +65,8 @@ def _build_ctx():
     ctx.profiles = None  # type: ignore[attr-defined]
     ctx.turn_context = _Recorder()  # type: ignore[attr-defined]  v0.0.6：多提供者 add
     ctx.on_turn_ended = _Recorder()  # type: ignore[attr-defined]  contribute(名字, 函数)
+    ctx.quota = _Recorder()  # type: ignore[attr-defined]  v0.1.1：quota.set（判定登记到这里）
+    ctx.usage = None  # type: ignore[attr-defined]  额度判定运行期才用
     from knowwork_server.tools.provided import ProvidedTools
 
     ctx.tools = ProvidedTools()  # type: ignore[attr-defined]  M3「记住」工具登记到这里

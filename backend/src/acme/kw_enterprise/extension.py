@@ -22,31 +22,37 @@ from .memory import tool as memory_tool
 from .memory.context import MemoryContext
 from .memory.jobs import EXTRACT, ORGANIZE
 from .memory.service import MemoryService
+from .quota import api as quota_api
+from .quota.service import QuotaService
 
-# 记忆层的迁移分支：装包就升级，不看授权（contract 的约定）
-MEMORY_MIGRATIONS = Path(__file__).with_name("memory_migrations")
+# 扩展的迁移分支（记忆 M1-M3 + 额度 acme_0004）：装包就升级，不看授权（contract 的约定）
+MIGRATIONS = Path(__file__).with_name("migrations")
 
 
 class Enterprise:
     name = "acme-enterprise"
     license_module = MODULE          # 授权里要有这个模块名才加载（license.py 给的就是它）
-    model_modules = ("acme.kw_enterprise.memory.models",)  # M1 起：记忆的三张全局表
-    rls_tables: tuple[str, ...] = ()                       # 记忆跟着人走、跨空间，不进 RLS
-    migrations = MEMORY_MIGRATIONS
+    model_modules = ("acme.kw_enterprise.memory.models",       # 记忆的三张全局表
+                     "acme.kw_enterprise.quota.models")        # 额度的五张全局表
+    rls_tables: tuple[str, ...] = ()                           # 都跨空间，不进 RLS
+    migrations = MIGRATIONS
 
     def setup_api(self, ctx: Any):
-        """业务服务启动时装配：路由 + 每轮上下文提供者 + 回合结束的提取入队 + 「记住」工具。
-        MemoryService 共用一份（路由 / 提供者 / 贡献者 / 工具），装配期构造一次。"""
+        """业务服务启动时装配：路由 + 每轮上下文提供者 + 回合结束的提取入队 + 「记住」工具
+        + 用量配额的判定（quota.set）。MemoryService / QuotaService 各共用一份，装配期构造一次。"""
         service = MemoryService(ctx.global_sessionmaker, ctx.access)
         context = MemoryContext(service, ctx.models, ctx.profiles)
         ctx.turn_context.add(context.provider)  # v0.0.6：多提供者按登记顺序拼，出错整轮不带
         ctx.on_turn_ended("memory", memory_extract.build_contributor(service, ctx.profiles))
         remember, available = memory_tool.build_remember_tool(service, ctx.models, ctx.profiles)
         ctx.tools.add(ProvidedTool(tool=remember, available=available))
+        quota = QuotaService(ctx.global_sessionmaker, ctx.access, ctx.usage)
+        ctx.quota.set(quota.check)  # 各端开始一轮之前判一次（进行中的轮不打断）
         return [workspaces_api.build_router(ctx),
                 skills_api.build_router(ctx),
                 mcp_api.build_router(ctx),
-                *memory_api.build_routers(ctx, service=service)]
+                *memory_api.build_routers(ctx, service=service),
+                *quota_api.build_routers(ctx, service=quota)]
 
     def setup_internal(self, ctx: Any):
         """内部端口路由：没有；保留方法体让以后加扩展服务回调时不用动装配。"""

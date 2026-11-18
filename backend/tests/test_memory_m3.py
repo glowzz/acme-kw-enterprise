@@ -12,7 +12,7 @@ from knowwork_server.tools.registry import ToolFailure
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from acme.kw_enterprise.extension import MEMORY_MIGRATIONS
+from acme.kw_enterprise.extension import MIGRATIONS
 from acme.kw_enterprise.memory import tool as memory_tool
 from acme.kw_enterprise.memory.models import (
     ACTIVE,
@@ -447,8 +447,9 @@ async def test_migration_backfills_decay_watermark(pg_url):
     finally:
         await admin.dispose()
     url = pg_url.replace("/postgres?", f"/{name}?")
-    branches = Branches(locations=(MEMORY_MIGRATIONS,),
-                        model_modules=("acme.kw_enterprise.memory.models",))
+    branches = Branches(locations=(MIGRATIONS,),
+                        model_modules=("acme.kw_enterprise.memory.models",
+                                   "acme.kw_enterprise.quota.models",))
 
     def _run(action):
         def step(sync_connection):

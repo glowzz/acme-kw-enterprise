@@ -1,7 +1,7 @@
 """记忆层的三张表：个人的、跨空间的（identity 同款：全局表，不进 RLS_TABLES）。
 
 设计见 docs/记忆层详细设计.md §2（对照上游 v0.0.4）。建表走扩展自己的迁移分支
-（memory_migrations/acme_0001）；这里只声明模型，迁移与模型要保持字段一致。
+（migrations/acme_0001）；这里只声明模型，迁移与模型要保持字段一致。
 """
 
 from datetime import datetime
