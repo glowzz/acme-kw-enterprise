@@ -224,7 +224,7 @@ export async function myQuota(): Promise<readonly MyQuotaState[]> {
 
 export async function quotaStatus(workspaceId: string): Promise<MyQuotaState | null> {
   const body = await request<unknown>(
-    `/api/quota/status?workspaceId=${encodeURIComponent(workspaceId)}`,
+    `/api/quota/status?workspace_id=${encodeURIComponent(workspaceId)}`,
   );
   return parseMyState(body) ?? null;
 }
