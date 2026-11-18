@@ -7,7 +7,10 @@ import type { RouteObject } from 'react-router';
 import { BookOpen } from '@openai/apps-sdk-ui/components/Icon';
 import type { Register } from '@knowwork/web/slots/registry';
 import { MemoryTab } from './pages/memory';
+import { QuotaTab } from './pages/quota';
 import { WorkspacesPage } from './pages/workspaces';
+import { QuotaComposerTop } from './panels/quota-composer';
+import { QuotaMePanel } from './panels/quota-me';
 import { SkillsEnterprisePanel } from './panels/skills-enterprise';
 import { ToolsEnterprisePanel } from './panels/tools-enterprise';
 
@@ -22,6 +25,12 @@ export function install(register: Register): void {
   register('admin.tools.enterprise', { children: <ToolsEnterprisePanel /> });
   // 个人设置 → 我的记忆：对话里「管理记忆」的深链是 /settings?tab=memory（chat.tools 的 notice 用）
   register('settings.tabs', { key: 'memory', label: '我的记忆', children: <MemoryTab /> });
+  // 用量 → 「额度」标签页：空间月总额、个人默认、按成员设额度与临时加额（对齐官方商业版口径）
+  register('admin.usage.tabs', { key: 'quota', label: '额度', children: <QuotaTab /> });
+  // 个人设置 → 我的用量顶栏：本人各空间的额度进度与恢复日期
+  register('settings.usage.top', { children: <QuotaMePanel /> });
+  // 输入框上方：本月额度用完（拦截口径）时提前拦住输入框，说清原因与恢复日期
+  register('chat.composer.top', { Component: QuotaComposerTop });
   // 「记住」工具在执行过程里的显示名与完成提示（回答下方一行，直达设置页）
   register('chat.tools', {
     name: 'remember',
