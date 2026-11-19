@@ -10,6 +10,7 @@ QuotaExceeded）。口径见 docs/额度层详细设计.md §2–§4：
 """
 
 import logging
+import statistics
 import uuid
 from collections.abc import Callable
 from datetime import date, timedelta
@@ -24,16 +25,20 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from .models import (
     BLOCK,
+    GROUP_TYPES,
     NEAR,
     SOURCE_DEFAULT,
+    SOURCE_GROUP,
     SOURCE_MEMBER,
     SOURCE_NONE,
     TARGET_GRANT,
+    TARGET_GROUP,
     TARGET_MEMBER,
     TARGET_WORKSPACE,
     WARN,
     QuotaChangeLog,
     QuotaGrant,
+    QuotaGroupSetting,
     QuotaMemberSetting,
     QuotaWorkspaceSetting,
 )
@@ -80,9 +85,45 @@ class QuotaService:
         async with self._sessionmaker() as session:
             value = await session.scalar(
                 select(func.coalesce(func.sum(QuotaGrant.extra_tokens), 0))
-                .where(QuotaGrant.workspace_id == workspace_id, QuotaGrant.user_id == user_id,
-                       QuotaGrant.month == month))
-            return int(value or 0)
+                .where(QuotaGrant.workspace_id == workspace_id,
+                       QuotaGrant.user_id == user_id, QuotaGrant.month == month))
+            return int(value)
+
+    async def _group_default(self, workspace_id: str,
+                             user_id: str) -> tuple[int | None, str | None, str | None]:
+        # 返回 (最高的一档 token 数, 组名, 口径)；没有命中的组就是 (None, None, None)
+        """这个人所在的部门/用户组里，默认额度最高的那一档（多个组同时命中取最高）；组不存在忽略。
+        department_member / user_group_member 在 RLS 名单里，事务里声明空间。"""
+        from knowwork_server.access.models import (
+            Department,
+            DepartmentMember,
+            UserGroup,
+            UserGroupMember,
+        )
+
+        async with self._sessionmaker() as session:
+            await set_workspace(session, workspace_id)
+            dept_rows = (await session.execute(
+                select(QuotaGroupSetting, Department.name)
+                .join(Department, Department.id == QuotaGroupSetting.group_id)
+                .join(DepartmentMember, DepartmentMember.department_id == Department.id)
+                .where(QuotaGroupSetting.workspace_id == workspace_id,
+                       QuotaGroupSetting.group_type == "department",
+                       DepartmentMember.workspace_id == workspace_id,
+                       DepartmentMember.user_id == user_id))).all()
+            group_rows = (await session.execute(
+                select(QuotaGroupSetting, UserGroup.name)
+                .join(UserGroup, UserGroup.id == QuotaGroupSetting.group_id)
+                .join(UserGroupMember, UserGroupMember.group_id == UserGroup.id)
+                .where(QuotaGroupSetting.workspace_id == workspace_id,
+                       QuotaGroupSetting.group_type == "user_group",
+                       UserGroupMember.workspace_id == workspace_id,
+                       UserGroupMember.user_id == user_id))).all()
+        candidates = [(row.monthly_tokens, name, row.mode) for row, name in (*dept_rows, *group_rows)]
+        if not candidates:
+            return None, None, None
+        best = max(candidates, key=lambda item: item[0])
+        return best[0], best[1], best[2]
 
     async def _user_kind(self, user_id: str) -> str:
         async with self._sessionmaker() as session:
@@ -94,18 +135,25 @@ class QuotaService:
         if kind is None:
             kind = await self._user_kind(user_id)
         if kind != USER_PERSON:  # 渠道账号与嵌入的外部用户只判空间总额，没有个人层
-            return {"tokens": None, "source": SOURCE_NONE, "mode": BLOCK, "grants": 0, "kind": kind}
+            return {"tokens": None, "source": SOURCE_NONE, "sourceName": None,
+                    "mode": BLOCK, "grants": 0, "kind": kind}
         member = await self._member_row(workspace_id, user_id)
         setting = await self._workspace_row(workspace_id)
         if member is not None:
-            tokens, source, mode = member.monthly_tokens, SOURCE_MEMBER, member.mode
-        elif setting is not None and setting.member_default_tokens is not None:
-            tokens, source, mode = setting.member_default_tokens, SOURCE_DEFAULT, setting.mode
+            tokens, source, mode, source_name = member.monthly_tokens, SOURCE_MEMBER, member.mode, None
         else:
-            tokens, source, mode = None, SOURCE_NONE, BLOCK
+            group_tokens, group_name, group_mode = await self._group_default(workspace_id, user_id)
+            if group_tokens is not None:
+                tokens, source, mode, source_name = group_tokens, SOURCE_GROUP, group_mode, group_name
+            elif setting is not None and setting.member_default_tokens is not None:
+                tokens, source, mode, source_name = (setting.member_default_tokens,
+                                                     SOURCE_DEFAULT, setting.mode, None)
+            else:
+                tokens, source, mode, source_name = None, SOURCE_NONE, BLOCK, None
         grants = await self._grants_sum(workspace_id, user_id, self._today().replace(day=1)) \
             if tokens is not None else 0
-        return {"tokens": tokens, "source": source, "mode": mode, "grants": grants, "kind": kind}
+        return {"tokens": tokens, "source": source, "sourceName": source_name,
+                "mode": mode, "grants": grants, "kind": kind}
 
     async def monthly_used(self, workspace_id: str, user_id: str) -> int:
         """本月已用（usage_daily，与统计页「按成员」同一条聚合）。"""
@@ -164,7 +212,7 @@ class QuotaService:
     # ---- 状态（overview 与「我的用量」共用）----
 
     @staticmethod
-    def _status(used: int, tokens: int | None) -> str | None:  # noqa: too-many-branches 不适用
+    def _status(used: int, tokens: int | None) -> str | None:
         """ok | near(≥85%) | exhausted；不限（tokens None）没有状态。"""
         if tokens is None or tokens <= 0:
             return None
@@ -350,6 +398,141 @@ class QuotaService:
                  "month": row.month.isoformat(), "extraTokens": row.extra_tokens,
                  "reason": row.reason, "grantedBy": row.granted_by,
                  "grantedAt": row.granted_at} for row, name in rows]
+
+    # ---- 组默认（M2：部门与用户组）----
+
+    async def groups(self, actor_id: str, workspace_id: str) -> list[dict[str, Any]]:
+        """组默认额度页的数据：空间里的部门与用户组清单，带上已设的默认（没设为 None）与人数。"""
+        await self._require_space_admin(actor_id, workspace_id)
+        from knowwork_server.access.models import (
+            Department,
+            DepartmentMember,
+            UserGroup,
+            UserGroupMember,
+        )
+
+        async with self._sessionmaker() as session:
+            await set_workspace(session, workspace_id)
+            dept_rows = (await session.execute(
+                select(Department.id, Department.name,
+                       func.count(DepartmentMember.user_id))
+                .outerjoin(DepartmentMember, DepartmentMember.department_id == Department.id)
+                .where(Department.workspace_id == workspace_id)
+                .group_by(Department.id, Department.name)
+                .order_by(Department.name))).all()
+            group_rows = (await session.execute(
+                select(UserGroup.id, UserGroup.name, func.count(UserGroupMember.user_id))
+                .outerjoin(UserGroupMember, UserGroupMember.group_id == UserGroup.id)
+                .where(UserGroup.workspace_id == workspace_id)
+                .group_by(UserGroup.id, UserGroup.name)
+                .order_by(UserGroup.name))).all()
+            settings = {row.group_type + ":" + row.group_id: row for row in
+                        (await session.scalars(select(QuotaGroupSetting)
+                                               .where(QuotaGroupSetting.workspace_id == workspace_id))).all()}
+        result = []
+        for kind, rows in (("department", dept_rows), ("user_group", group_rows)):
+            for row in rows:
+                setting = settings.get(f"{kind}:{row.id}")
+                result.append({"groupType": kind, "groupId": row.id, "name": row.name,
+                               "members": row[2],
+                               "monthlyTokens": None if setting is None else setting.monthly_tokens,
+                               "mode": setting.mode if setting else BLOCK})
+        return result
+
+    async def set_group_setting(self, actor_id: str, workspace_id: str, group_type: str, group_id: str,
+                                monthly_tokens: int | None, mode: str) -> dict[str, Any]:
+        """组默认：设一个正数；None = 删除。组必须真实存在（防止手滑建出悬空规则）。"""
+        await self._require_space_admin(actor_id, workspace_id)
+        if group_type not in GROUP_TYPES:
+            raise Invalid("组类型只有 department 与 user_group")
+        if monthly_tokens is not None and monthly_tokens <= 0:
+            raise Invalid("组默认额度必须为正")
+        if mode not in (BLOCK, WARN):
+            raise Invalid(f"口径只能是 {BLOCK} 或 {WARN}")
+        from knowwork_server.access.models import Department, UserGroup
+
+        async with self._sessionmaker() as session:
+            await set_workspace(session, workspace_id)
+            if group_type == "department":
+                exists = await session.get(Department, group_id)
+            else:
+                exists = await session.get(UserGroup, group_id)
+        if exists is None:
+            raise Invalid("这个组不存在（可能已删除）")
+        before_row = await self._group_setting_row(workspace_id, group_type, group_id)
+        before = None if before_row is None else {
+            "monthly_tokens": before_row.monthly_tokens, "mode": before_row.mode}
+        async with self._sessionmaker() as session, session.begin():
+            if monthly_tokens is None:
+                row = await self._group_setting_row(workspace_id, group_type, group_id)
+                if row is not None:
+                    await session.delete(row)
+                after = None
+            else:
+                row = await self._group_setting_row(workspace_id, group_type, group_id)
+                after = {"monthly_tokens": monthly_tokens, "mode": mode}
+                if row is None:
+                    session.add(QuotaGroupSetting(workspace_id=workspace_id, group_type=group_type,
+                                                  group_id=group_id, monthly_tokens=monthly_tokens,
+                                                  mode=mode, updated_by=actor_id))
+                else:
+                    row.monthly_tokens = monthly_tokens
+                    row.mode = mode
+                    row.updated_by = actor_id
+            await self._log(session, workspace_id, TARGET_GROUP, group_id, before, after, actor_id)
+        return {"groupType": group_type, "groupId": group_id,
+                "monthlyTokens": monthly_tokens, "mode": mode}
+
+    async def _group_setting_row(self, workspace_id: str, group_type: str,
+                                 group_id: str) -> QuotaGroupSetting | None:
+        async with self._sessionmaker() as session:
+            return await session.get(QuotaGroupSetting, (workspace_id, group_type, group_id))
+
+    # ---- 参考建议值（M2：最近 30 天每人用了多少 → 建议默认额度）----
+
+    async def suggestion(self, actor_id: str, workspace_id: str) -> dict[str, Any]:
+        """最近 30 天每人用量的平均/中位数/P90 与建议默认额度（P90 向上取整到 10 万的整倍数），
+        折算成约多少轮对话与多少元。只统计真人成员（机器人与访客不占个人额度）。"""
+        await self._require_space_admin(actor_id, workspace_id)
+        end = self._today()
+        start = end - timedelta(days=29)
+        summaries = await self._usage.summary(workspace_id, start, end, GroupBy.USER)
+        members = {member["id"]: member for member in await self._members(workspace_id)}
+        used = [(item.total_tokens, item.key) for item in summaries
+                if item.key in members and members[item.key]["kind"] == USER_PERSON]
+        used.sort()
+        tokens_list = [tokens for tokens, _ in used]
+        turns = await self._usage.turns(workspace_id, start, end)
+        cost_total = sum(item.cost for item in summaries
+                         if item.key in members and members[item.key]["kind"] == USER_PERSON)
+
+        def p90(values: list[int]) -> int:
+            """最近一档的 P90：nearest-rank（样本少时插值法会飘）。"""
+            import math
+            return sorted(values)[math.ceil(len(values) * 0.9) - 1]
+
+        def rounded(value: float) -> int:
+            step = 100_000
+            return int((value + step - 1) // step * step)
+
+        suggested = rounded(p90(tokens_list)) if tokens_list else None
+        per_turn = (sum(tokens_list) / turns) if turns else None
+        max_row = max(used, key=lambda item: item[0]) if used else None
+        return {
+            "days": 30,
+            "users": len(tokens_list),
+            "average": int(statistics.mean(tokens_list)) if tokens_list else 0,
+            "median": int(statistics.median(tokens_list)) if tokens_list else 0,
+            "p90": p90(tokens_list) if tokens_list else 0,
+            "max": {"userId": max_row[1], "name": members[max_row[1]]["name"],
+                    "tokens": max_row[0]} if max_row else None,
+            "suggestedDefault": suggested,
+            "perTurnTokens": int(per_turn) if per_turn else None,
+            "quotaTurns": int(suggested / per_turn) if suggested and per_turn else None,
+            "costTotal": float(cost_total),
+            "quotaCost": (float(suggested * cost_total / sum(tokens_list))
+                          if suggested and sum(tokens_list) else None),
+        }
 
     async def changes(self, actor_id: str, workspace_id: str, limit: int = 100) -> list[dict[str, Any]]:
         """变更记录（M2 出页面；M1 先给接口与落库）。"""

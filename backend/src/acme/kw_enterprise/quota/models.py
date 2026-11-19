@@ -23,14 +23,14 @@ from sqlalchemy.orm import Mapped, mapped_column
 # 提醒口径：block 超额拦这一轮（QuotaExceeded），warn 放行只提醒
 BLOCK, WARN = "block", "warn"
 MODES = (BLOCK, WARN)
-# 额度来自（overview 标注）：个人设置 / 空间默认 / 不限（M2 加部门与用户组）
-SOURCE_MEMBER, SOURCE_DEFAULT, SOURCE_NONE = "member", "default", "none"
+# 额度来自（overview 标注）：个人设置 / 组默认（部门、用户组）/ 空间默认 / 不限
+SOURCE_MEMBER, SOURCE_GROUP, SOURCE_DEFAULT, SOURCE_NONE = "member", "group", "default", "none"
 # 状态（overview 成员行与我的用量）：已用 85% 起「接近上限」，用完「已用完」
 NEAR = 0.85
 # 组类型（M2 的表，M1 建好不使用）
 GROUP_TYPES = ("department", "user_group")
 # 变更记录的 target
-TARGET_WORKSPACE, TARGET_MEMBER, TARGET_GRANT = "workspace", "member", "grant"
+TARGET_WORKSPACE, TARGET_MEMBER, TARGET_GROUP, TARGET_GRANT = "workspace", "member", "group", "grant"
 
 
 class QuotaWorkspaceSetting(Base):

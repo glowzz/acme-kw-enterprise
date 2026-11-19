@@ -45,6 +45,13 @@ class MemberSettingBody(BaseModel):
     mode: Mode = "block"
 
 
+class GroupSettingBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    monthlyTokens: int | None = Field(default=None, ge=1)  # None = 删除组默认
+    mode: Mode = "block"
+
+
 class GrantBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -117,6 +124,27 @@ def build_routers(ctx, service: QuotaService | None = None) -> list[APIRouter]:
     async def list_grants(workspace_id: WorkspacePath, who: Who) -> list[dict]:
         """本空间的临时加额（M1 只出当月）"""
         return await _call(service.grants(who.user_id, workspace_id))
+
+    @workspace_router.get("/groups")
+    async def list_groups(workspace_id: WorkspacePath, who: Who) -> list[dict]:
+        """部门与用户组清单（带人数与已设的默认额度；没设为 None）"""
+        return await _call(service.groups(who.user_id, workspace_id))
+
+    @workspace_router.put("/group/{group_type}/{group_id}")
+    async def put_group(workspace_id: WorkspacePath, group_type: str, group_id: UserPath,
+                        body: GroupSettingBody, who: Who) -> dict:
+        """组默认额度（None 删除）；一次在多个组里的人取最高的那档，个人设置覆盖组默认"""
+        result = await _call(service.set_group_setting(who.user_id, workspace_id, group_type,
+                                                       group_id, body.monthlyTokens, body.mode))
+        annotate(action="quota.group.update", resource_type="quota", resource_id=group_id,
+                 workspace_id=workspace_id, group_type=group_type,
+                 monthly_tokens=body.monthlyTokens, mode=body.mode)
+        return result
+
+    @workspace_router.get("/suggestion")
+    async def suggestion(workspace_id: WorkspacePath, who: Who) -> dict:
+        """最近 30 天每人用量的参考（平均/中位数/P90/最多）与建议的默认额度"""
+        return await _call(service.suggestion(who.user_id, workspace_id))
 
     @workspace_router.get("/changes")
     async def list_changes(workspace_id: WorkspacePath, who: Who, limit: int = 100) -> list[dict]:

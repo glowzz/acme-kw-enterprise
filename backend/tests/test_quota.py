@@ -111,10 +111,11 @@ class FakeAccess:
 
 
 class FakeUsage:
-    """UsageRecorder.summary 假件：按 (workspace, user) 记本月已用，忽略日期参数（范围由服务算）。"""
+    """UsageRecorder 假件：summary 按 (workspace, user) 记本月已用；turns 给建议值用的轮数。"""
 
-    def __init__(self, used: dict[tuple[str, str], int] | None = None) -> None:
+    def __init__(self, used: dict[tuple[str, str], int] | None = None, turns: int = 0) -> None:
         self.used = dict(used or {})
+        self.turns_count = turns
 
     async def summary(self, workspace_id: str, start: date, end: date, group_by: GroupBy, *,
                       user_id: str | None = None) -> tuple[UsageSummary, ...]:
@@ -122,8 +123,11 @@ class FakeUsage:
         ids = [user_id] if user_id is not None else sorted(
             {key[1] for key in self.used if key[0] == workspace_id})
         return tuple(UsageSummary(key=key, calls=0, input_tokens=0, output_tokens=0,
-                                  total_tokens=self.used[(workspace_id, key)], cost=Decimal(0))
+                                  total_tokens=self.used[(workspace_id, key)], cost=Decimal("0.5"))
                      for key in ids if (workspace_id, key) in self.used)
+
+    async def turns(self, workspace_id: str, start: date, end: date) -> int:
+        return self.turns_count
 
 
 def make_service(sessionmaker, access=None, used=None, today=TODAY) -> QuotaService:
@@ -153,7 +157,8 @@ async def seed_workspace_setting(sessionmaker, monthly_total=None, member_defaul
 async def test_no_config_means_unlimited(sessionmaker):
     service = make_service(sessionmaker)
     resolved = await service.resolve(WS, "u2")
-    assert resolved == {"tokens": None, "source": "none", "mode": BLOCK, "grants": 0, "kind": "person"}
+    assert resolved == {"tokens": None, "source": "none", "sourceName": None,
+                        "mode": BLOCK, "grants": 0, "kind": "person"}
 
 
 async def test_member_default_then_member_override(sessionmaker):
@@ -381,3 +386,102 @@ async def test_migration_branch_up_and_down(pg_url):
     finally:
         await engine.dispose()
         await _drop_database(pg_url, name)
+
+
+# ---- M2：部门与用户组、建议值、变更记录 ----
+
+
+async def seed_groups(sessionmaker):
+    """两个组：部门 dept1（u1、u2）+ 用户组 grp1（u2）；各自设默认额度。"""
+    from knowwork_server.access.models import Department, DepartmentMember, UserGroup, UserGroupMember
+
+    async with sessionmaker() as session, session.begin():
+        session.add(Department(id="dept1", workspace_id=WS, name="销售部"))
+        session.add(Department(id="dept_gone", workspace_id=WS, name="已删的部"))
+        session.add(DepartmentMember(department_id="dept1", user_id="u1", workspace_id=WS))
+        session.add(DepartmentMember(department_id="dept1", user_id="u2", workspace_id=WS))
+        session.add(UserGroup(id="grp1", workspace_id=WS, name="季报专项"))
+        session.add(UserGroupMember(group_id="grp1", user_id="u2", workspace_id=WS))
+    service = make_service(sessionmaker)
+    await service.set_group_setting("u1", WS, "department", "dept1", 1_000_000, BLOCK)
+    await service.set_group_setting("u1", WS, "user_group", "grp1", 3_000_000, BLOCK)
+
+
+async def test_group_default_takes_the_highest(sessionmaker):
+    await seed_groups(sessionmaker)
+    service = make_service(sessionmaker)
+    # u2 同时在两个组里：取最高的 3M（用户组），来源标注组名
+    resolved = await service.resolve(WS, "u2")
+    assert (resolved["tokens"], resolved["sourceName"]) == (3_000_000, "季报专项")
+    # u1 只在部门里：1M
+    resolved = await service.resolve(WS, "u1")
+    assert (resolved["tokens"], resolved["source"]) == (1_000_000, "group")
+
+
+async def test_member_setting_overrides_group(sessionmaker):
+    await seed_groups(sessionmaker)
+    service = make_service(sessionmaker)
+    await service.set_member_setting("u1", WS, "u2", 500_000, BLOCK)
+    resolved = await service.resolve(WS, "u2")
+    assert (resolved["tokens"], resolved["source"]) == (500_000, "member")
+
+
+async def test_group_settings_survive_group_removal(sessionmaker):
+    """组被删（成员行没了）后遗留的组默认被忽略：回到空间默认，页面也不再列它。"""
+    await seed_groups(sessionmaker)
+    async with sessionmaker() as session, session.begin():
+        await session.execute(text(
+            "DELETE FROM department_member WHERE department_id = 'dept1' AND user_id = 'u2'"))
+    service = make_service(sessionmaker)
+    await seed_workspace_setting(sessionmaker, member_default=800_000)
+    # u2 还在用户组 grp1 里：仍然 3M（部门默认 1M 被更高的组盖住）
+    resolved = await service.resolve(WS, "u2")
+    assert resolved["tokens"] == 3_000_000
+    # u1 被移出部门、又没进组：组层归零，回到空间默认
+    async with sessionmaker() as session, session.begin():
+        await session.execute(text(
+            "DELETE FROM department_member WHERE department_id = 'dept1' AND user_id = 'u1'"))
+    resolved = await service.resolve(WS, "u1")
+    assert (resolved["tokens"], resolved["source"]) == (800_000, "default")
+    listed = await service.groups("u1", WS)
+    assert {row["groupId"] for row in listed} == {"dept1", "dept_gone", "grp1"}  # 组本身还在清单里
+
+
+async def test_group_setting_validates_and_logs(sessionmaker):
+    await seed_groups(sessionmaker)
+    service = make_service(sessionmaker)
+    with pytest.raises(Invalid):
+        await service.set_group_setting("u1", WS, "department", "no_such", 100, BLOCK)
+    with pytest.raises(Invalid):
+        await service.set_group_setting("u1", WS, "workspace", "x", 100, BLOCK)
+    await service.set_group_setting("u1", WS, "department", "dept_gone", 900_000, BLOCK)  # 组在就能设
+    async with sessionmaker() as session:
+        rows = (await session.scalars(select(QuotaChangeLog).where(
+            QuotaChangeLog.target == "group", QuotaChangeLog.target_id == "dept_gone")
+            .order_by(QuotaChangeLog.id))).all()
+    assert len(rows) == 1 and rows[0].target_id == "dept_gone"
+    await service.set_group_setting("u1", WS, "department", "dept_gone", None, BLOCK)
+    async with sessionmaker() as session:
+        rows = (await session.scalars(select(QuotaChangeLog).where(
+            QuotaChangeLog.target == "group", QuotaChangeLog.target_id == "dept_gone")
+            .order_by(QuotaChangeLog.id))).all()
+    assert len(rows) == 2 and rows[1].after is None
+
+
+async def test_suggestion_matches_reference_math(sessionmaker):
+    await seed_workspace_setting(sessionmaker)
+    used = {(WS, "u1"): 1_000_000, (WS, "u2"): 2_000_000, (WS, "u4"): 500_000, (WS, "u3"): 300_000}
+    service = QuotaService(sessionmaker, FakeAccess(), FakeUsage(used, turns=100), today=lambda: TODAY)
+    data = await service.suggestion("u1", WS)
+    assert data["users"] == 2  # 只统计真人成员（u3 机器人、u4 访客不算）
+    assert data["average"] == 1_500_000 and data["median"] == 1_500_000
+    assert data["p90"] == 2_000_000 and data["suggestedDefault"] == 2_000_000
+    assert data["max"]["userId"] == "u2" and data["max"]["tokens"] == 2_000_000
+    assert data["quotaTurns"] == 66  # 200 万 ÷ 每轮 3 万（30 天总量 300 万 ÷ 100 轮）
+    assert data["quotaCost"] is not None
+
+
+async def test_suggestion_empty_room(sessionmaker):
+    service = make_service(sessionmaker)
+    data = await service.suggestion("u1", WS)
+    assert data["users"] == 0 and data["suggestedDefault"] is None
