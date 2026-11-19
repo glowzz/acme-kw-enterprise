@@ -75,6 +75,44 @@ export interface MyQuotaState {
   readonly workspaceMode: QuotaMode;
 }
 
+export const GROUP_TYPE_LABELS: Readonly<Record<string, string>> = {
+  department: '部门',
+  user_group: '用户组',
+};
+
+export interface QuotaGroupRow {
+  readonly groupType: string;
+  readonly groupId: string;
+  readonly name: string;
+  readonly members: number;
+  readonly monthlyTokens: number | null;
+  readonly mode: QuotaMode;
+}
+
+export interface QuotaSuggestion {
+  readonly days: number;
+  readonly users: number;
+  readonly average: number;
+  readonly median: number;
+  readonly p90: number;
+  readonly max: { readonly userId: string; readonly name: string; readonly tokens: number } | null;
+  readonly suggestedDefault: number | null;
+  readonly perTurnTokens: number | null;
+  readonly quotaTurns: number | null;
+  readonly costTotal: number;
+  readonly quotaCost: number | null;
+}
+
+export interface QuotaChangeRow {
+  readonly id: number;
+  readonly target: string;
+  readonly targetId: string | null;
+  readonly before: Record<string, unknown> | null;
+  readonly after: Record<string, unknown> | null;
+  readonly changedBy: string;
+  readonly changedAt: string | null;
+}
+
 export interface QuotaGrantItem {
   readonly grantId: string;
   readonly userId: string;
@@ -227,4 +265,80 @@ export async function quotaStatus(workspaceId: string): Promise<MyQuotaState | n
     `/api/quota/status?workspace_id=${encodeURIComponent(workspaceId)}`,
   );
   return parseMyState(body) ?? null;
+}
+
+export async function quotaGroups(workspaceId: string): Promise<readonly QuotaGroupRow[]> {
+  const body = await request<unknown>(`/api/workspaces/${workspaceId}/quota/groups`);
+  return listOf(body, parseGroup);
+}
+
+function parseGroup(value: unknown): QuotaGroupRow | undefined {
+  if (!isRecord(value)) return undefined;
+  const groupId = str(value.groupId);
+  const groupType = str(value.groupType);
+  if (!groupId || !groupType) return undefined;
+  return {
+    groupType,
+    groupId,
+    name: str(value.name) ?? groupId,
+    members: num(value.members) ?? 0,
+    monthlyTokens: num(value.monthlyTokens) ?? null,
+    mode: (str(value.mode) ?? 'block') as QuotaMode,
+  };
+}
+
+export async function setGroupQuota(
+  workspaceId: string,
+  groupType: string,
+  groupId: string,
+  monthlyTokens: number | null,
+  mode: QuotaMode,
+): Promise<void> {
+  await request(`/api/workspaces/${workspaceId}/quota/group/${groupType}/${groupId}`, {
+    method: 'PUT',
+    body: { monthlyTokens, mode },
+  });
+}
+
+export async function quotaSuggestion(workspaceId: string): Promise<QuotaSuggestion | null> {
+  const body = await request<unknown>(`/api/workspaces/${workspaceId}/quota/suggestion`);
+  if (!isRecord(body)) return null;
+  const max = isRecord(body.max) ? {
+    userId: str(body.max.userId) ?? '',
+    name: str(body.max.name) ?? '',
+    tokens: num(body.max.tokens) ?? 0,
+  } : null;
+  return {
+    days: num(body.days) ?? 30,
+    users: num(body.users) ?? 0,
+    average: num(body.average) ?? 0,
+    median: num(body.median) ?? 0,
+    p90: num(body.p90) ?? 0,
+    max,
+    suggestedDefault: num(body.suggestedDefault) ?? null,
+    perTurnTokens: num(body.perTurnTokens) ?? null,
+    quotaTurns: num(body.quotaTurns) ?? null,
+    costTotal: num(body.costTotal) ?? 0,
+    quotaCost: num(body.quotaCost) ?? null,
+  };
+}
+
+function parseChange(value: unknown): QuotaChangeRow | undefined {
+  if (!isRecord(value)) return undefined;
+  const id = num(value.id);
+  if (id === undefined) return undefined;
+  return {
+    id,
+    target: str(value.target) ?? '',
+    targetId: str(value.targetId) ?? null,
+    before: isRecord(value.before) ? value.before : null,
+    after: isRecord(value.after) ? value.after : null,
+    changedBy: str(value.changedBy) ?? '',
+    changedAt: str(value.changedAt) ?? null,
+  };
+}
+
+export async function quotaChanges(workspaceId: string): Promise<readonly QuotaChangeRow[]> {
+  const body = await request<unknown>(`/api/workspaces/${workspaceId}/quota/changes`);
+  return listOf(body, parseChange);
 }

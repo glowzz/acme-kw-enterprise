@@ -8,8 +8,13 @@ import { useQuery } from '@tanstack/react-query';
 import { currentWorkspaceId } from '@knowwork/web/stores/workspace';
 import { quotaStatus } from '../quota';
 
+function wan(tokens: number | null): string {
+  if (tokens === null) return '不限';
+  if (tokens < 10000) return String(tokens);
+  return `${(tokens / 10000).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万`;
+}
+
 export function QuotaComposerTop({
-  conversationId,
   running,
   block,
 }: {
@@ -40,13 +45,23 @@ export function QuotaComposerTop({
       block(`本月额度已用完（${state.workspaceName}），${left}；可找空间管理员临时加额`);
       return;
     }
-    if (state.mode === 'warn' && state.status === 'exhausted') {
-      // 只提醒：不拦输入框，提醒由「我的用量」与回答时的说明承担（M2 挂 block 只读文案）
-      block(null);
-      return;
-    }
     block(null);
-  }, [states.data, states.isFetching, block, conversationId]);
+  }, [states.data, states.isFetching, block]);
 
-  return null; // 这一项只负责拦与放；可见的提醒条在「我的用量」与 M2 的 composer 提醒
+  const state = states.data ?? null;
+  const status = state?.status ?? null;
+  const reminder = state === null || status === null || status === 'ok'
+    ? null
+    : status === 'exhausted'
+      ? (state.mode === 'warn'
+        ? `本月额度已用完（只提醒口径，照常回答）；${Number(state.resetsOn.slice(5, 7))} 月 1 日恢复`
+        : null) // 拦截口径由 block(reason) 提示，不另画一条
+      : `本月额度已用 ${Math.round((state.used / (state.effective ?? 1)) * 100)}%，还剩 ${wan((state.effective ?? 0) - state.used)} token`;
+
+  if (reminder === null) return null;
+  return (
+    <div className={`rounded-md px-3 py-2 text-xs ${status === 'exhausted' ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-700'}`}>
+      {reminder}
+    </div>
+  );
 }
