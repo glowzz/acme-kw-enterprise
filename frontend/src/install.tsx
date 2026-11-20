@@ -13,6 +13,7 @@ import { QuotaComposerTop } from './panels/quota-composer';
 import { QuotaMePanel } from './panels/quota-me';
 import { SkillsEnterprisePanel } from './panels/skills-enterprise';
 import { ToolsEnterprisePanel } from './panels/tools-enterprise';
+import { mdFileEditing } from './mdedit';
 
 export function install(register: Register): void {
   // 管理后台「系统」分组的菜单项（只有系统管理员可见，排在「模型」后面）
@@ -31,6 +32,8 @@ export function install(register: Register): void {
   register('settings.usage.top', { children: <QuotaMePanel /> });
   // 输入框上方：本月额度用完（拦截口径）时提前拦住输入框，说清原因与恢复日期
   register('chat.composer.top', { Component: QuotaComposerTop });
+  // Markdown 人机双改：云端对话的 .md 文件在预览抽屉里直接编辑（人保存成新一版、AI 改动轮末发现、冲突由人拍板）
+  register('chat.files.server', mdFileEditing);
   // 「记住」工具在执行过程里的显示名与完成提示（回答下方一行，直达设置页）
   register('chat.tools', {
     name: 'remember',

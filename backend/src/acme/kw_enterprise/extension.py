@@ -15,6 +15,7 @@ from knowwork_server.tools.provided import ProvidedTool
 
 from . import mcp_api, skills_api, workspaces_api
 from .license import MODULE
+from .mdedit import api as mdedit_api
 from .memory import api as memory_api
 from .memory import extract as memory_extract
 from .memory import organize as memory_organize
@@ -52,7 +53,8 @@ class Enterprise:
                 skills_api.build_router(ctx),
                 mcp_api.build_router(ctx),
                 *memory_api.build_routers(ctx, service=service),
-                *quota_api.build_routers(ctx, service=quota)]
+                *quota_api.build_routers(ctx, service=quota),
+                mdedit_api.build_router(ctx)]
 
     def setup_internal(self, ctx: Any):
         """内部端口路由：没有；保留方法体让以后加扩展服务回调时不用动装配。"""

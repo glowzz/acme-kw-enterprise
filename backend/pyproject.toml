@@ -26,3 +26,7 @@ line-length = 110
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# 编辑器页是嵌在字符串里的整份 HTML/CSS/JS，行宽按数据豁免
+"src/acme/kw_enterprise/mdedit/editor_page.py" = ["E501"]
