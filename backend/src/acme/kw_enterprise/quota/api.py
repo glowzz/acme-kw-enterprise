@@ -76,6 +76,7 @@ def build_routers(ctx, service: QuotaService | None = None) -> list[APIRouter]:
 
     @router.get("/status")
     async def quota_status(who: Who, workspace_id: str = Query(min_length=1, max_length=64)) -> dict:  # noqa: B008
+        """单个空间的本人额度状态（输入框按当前空间问）"""
         return await _call(service.member_state(workspace_id, who.user_id))
 
     # ---- 管理端（空间管理员）----
