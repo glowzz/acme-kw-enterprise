@@ -195,3 +195,23 @@ async def test_digest_endpoint(client, editing):
     assert response.status_code == 200
     assert response.json()["digest"] == hashlib.sha256(CONTENT_V1.encode()).hexdigest()
     assert json.dumps(response.json())
+
+
+async def test_save_new_file_without_prior_version(client, editing):
+    """编辑器里新建一份此前不存在的笔记：没有历史版就跳过冲突检查，直接存成 v1。"""
+    new_path = "output/新笔记.md"
+    content = "# 新笔记\n\n从编辑器里建的。\n"
+    response = await client.put(
+        f"/api/workspaces/{WS}/md-editor/file",
+        json={"conversation_id": CONV, "path": new_path, "content": content,
+              "base_digest": "0" * 64, "force": False},
+    )
+    assert response.status_code == 200 and response.json()["changed"] is True
+    assert editing.store[new_path].decode() == content
+    # 再存同样的内容：与最新一致，不另存
+    again = await client.put(
+        f"/api/workspaces/{WS}/md-editor/file",
+        json={"conversation_id": CONV, "path": new_path, "content": content,
+              "base_digest": response.json()["digest"], "force": False},
+    )
+    assert again.json()["changed"] is False

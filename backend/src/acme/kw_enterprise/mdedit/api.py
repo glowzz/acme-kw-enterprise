@@ -11,6 +11,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from knowwork_server.auth.principal import Principal
+from knowwork_server.documents.editing import EditRefused
 from pydantic import BaseModel, ConfigDict, Field
 
 from .editor_page import PAGE
@@ -22,13 +23,11 @@ _FORMAT_NOTE = "现在只有 Markdown（.md/.markdown/.mkd）能在网页里改"
 
 async def _call(awaitable) -> Any:
     """file_editing 的 EditRefused → HTTP（status 由内核给，消息直接给人看）。"""
-    from knowwork_server.documents.editing import EditRefused
-
     try:
         return await awaitable
     except EditRefused as error:
         raise HTTPException(status_code=error.status,
-                            detail={"code": "mdedit_refused", "message": error.message}) from error
+                            detail={"code": "mdedit_refused", "message": str(error)}) from error
 
 
 class SaveBody(BaseModel):
@@ -95,7 +94,8 @@ def build_router(ctx) -> APIRouter:
 
     @router.put("/file")
     async def save_file(workspace_id: str, body: SaveBody, who: Who) -> dict:
-        """存成对话里这个路径的新一版。base_digest 与最新版不一致且非 force → 409，带最新内容给人选"""
+        """存成对话里这个路径的新一版。base_digest 与最新版不一致且非 force → 409，带最新内容给人选；
+        这份文件还没有任何一版（编辑器里新建的笔记）时跳过冲突检查，直接存成 v1"""
         await _member(who, workspace_id)
         _editable(body.path)
         data = body.content.encode("utf-8")
@@ -103,8 +103,14 @@ def build_router(ctx) -> APIRouter:
         editing = _editing()
         file = await _call(editing.locate(workspace_id=workspace_id, conversation_id=body.conversation_id,
                                           user_id=who.user_id, path=body.path))
-        latest = await _call(editing.latest_digest(file))
-        if latest != body.base_digest and not body.force:
+        try:
+            latest: str | None = await editing.latest_digest(file)
+        except EditRefused as error:
+            if error.status not in (404, 410):
+                raise HTTPException(status_code=error.status,
+                                    detail={"code": "mdedit_refused", "message": str(error)}) from error
+            latest = None  # 文件还不存在（或已彻底没了）：这次保存就是 v1
+        if latest is not None and latest != body.base_digest and not body.force:
             conflict = await _call(editing.read(file))
             return Response(
                 json.dumps({"latest_digest": latest, "content": conflict.decode("utf-8", errors="replace")},
